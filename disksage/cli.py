@@ -301,7 +301,13 @@ def cmd_scan(args) -> int:
     con.print(f"[dim]{legend}[/dim]") if con else print(legend)
 
     t = _totals(items)
-    msg = (f"\nReclaimable now → safe: {human(t['safe'])}   "
+    reclaimable = t["safe"] + t["duplicate"] + t["review"]
+    non_cache = t["duplicate"] + t["review"]
+    if reclaimable > 0 and non_cache > 0:
+        headline = (f"\n{human(reclaimable)} reclaimable — only {human(t['safe'])} is cache.\n"
+                    f"The rest is dev cruft, duplicates & large files a cache cleaner misses.")
+        con.print(f"[bold]{headline}[/bold]") if con else print(headline)
+    msg = (f"\nBreakdown → cache: {human(t['safe'])}   "
            f"duplicates: {human(t['duplicate'])}   review: {human(t['review'])}   "
            f"(keep: {human(t['keep'])})\n"
            f"Disk: {_free_space()}")

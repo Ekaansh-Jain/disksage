@@ -1,13 +1,19 @@
 # disksage
 
-An AI-aware, safety-first disk cleaner for macOS. It finds where your space
-actually went, **explains what each thing is in plain language**, and only ever
-moves approved items to the Trash — never `rm -rf`, never without asking.
+**Reclaim the tens of GB your Mac's Storage screen hides — dead virtualenvs,
+`node_modules` graveyards, duplicate model checkpoints, forgotten datasets and
+local model stores — and clear them safely. Not another cache cleaner.**
 
-Most disk tools just show you a big anonymous blob and let you delete blindly.
-`disksage` recognises the long tail — the Arduino cores, the browser caches, the
-bloated `.git`, the `node_modules` graveyard — tells you *why* each one is safe
-or risky, and refuses to touch anything it shouldn't.
+Generic cleaners free a few GB of cache and stop there. On a real developer's
+machine the space is somewhere else entirely: 20+ GB of abandoned `.venv`s
+across old projects, duplicate `.safetensors`, giant `.h5` files, `~/.lmstudio`
+models, stale build output. `disksage` finds **all** of it, **tells you what
+each thing is and whether it's safe to delete**, detects byte-exact duplicates,
+and only ever moves what you approve to the Trash — never `rm -rf`, never
+without asking.
+
+> On a typical dev disk it surfaces ~50 GB reclaimable — of which only a few GB
+> is actually cache. The rest is what everything else misses.
 
 ## How it works
 

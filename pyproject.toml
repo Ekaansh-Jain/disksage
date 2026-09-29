@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "disksage"
 version = "0.1.0"
-description = "AI-aware, safety-first disk cleaner for macOS"
+description = "Developer disk cleaner for macOS — finds dead venvs, duplicates, model files & more, not just caches"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }

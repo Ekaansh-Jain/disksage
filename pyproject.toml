@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "disksage"
+version = "0.1.0"
+description = "AI-aware, safety-first disk cleaner for macOS"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Ekaansh Jain" }]
+dependencies = [
+    "openai>=1.30",
+    "send2trash>=1.8",
+    "rich>=13.0",
+    "python-dotenv>=1.0",
+    "questionary>=2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+disksage = "disksage.cli:main"
+
+[tool.setuptools]
+packages = ["disksage"]

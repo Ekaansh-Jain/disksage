@@ -1,0 +1,5 @@
+openai>=1.30
+send2trash>=1.8
+rich>=13.0
+python-dotenv>=1.0
+questionary>=2.0

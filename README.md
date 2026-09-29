@@ -113,21 +113,24 @@ The first time you run `disksage`, it asks how you want unknown files labelled:
 Choose an AI provider:
 ❯ Groq — free cloud API (paste a key)
   Google Gemini — free cloud API (paste a key)
-  Local LM Studio — private, no key (needs the app running)
+  Local — auto-detect (Ollama, LM Studio, llama.cpp, …)
   No AI — use the built-in knowledge base only
 ```
 
 Pick one; if it needs a key you paste it once (hidden input) and it's saved to
-`~/.config/disksage/.env` (chmod 600). Re-run anytime with `disksage setup`, or
-set the keys yourself — auto-detect order is **local → Groq → Gemini**:
+`~/.config/disksage/.env` (chmod 600). Re-run anytime with `disksage setup`.
 
-- **LM Studio** (local, private, offline) — start its server; auto-detected on `:1234`.
+- **Local** — works with any OpenAI-compatible server. Setup scans the usual
+  ports and lets you pick, or enter a custom URL. Supports **Ollama** (`:11434`),
+  **LM Studio** (`:1234`), **llama.cpp** / **LocalAI** (`:8080`), **Jan**
+  (`:1337`), and more. Private and offline.
 - **Groq** — `GROQ_API_KEY`.
 - **Gemini** — `GEMINI_API_KEY`.
 
-Keys stay on your machine; only paths + sizes are ever sent to the provider you
-chose. The tool works fully with **No AI** too — you just lose labels on
-unrecognized folders.
+Run `disksage doctor` to see the active provider and which local servers are
+reachable. Keys stay on your machine; only paths + sizes are ever sent to the
+provider you chose. The tool works fully with **No AI** too — you just lose
+labels on unrecognized folders.
 
 ## Safety
 

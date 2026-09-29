@@ -79,6 +79,70 @@ def _totals(items) -> dict[str, int]:
     return out
 
 
+def _custom_local(questionary) -> dict:
+    base = questionary.text(
+        "Base URL of the OpenAI-compatible server "
+        "(e.g. http://localhost:11434/v1):").ask()
+    if not base or not base.strip():
+        return {}
+    base = base.strip()
+    if not base.startswith(("http://", "https://")):
+        base = "http://" + base
+    models = llm.list_models(base)
+    if models:
+        model = models[0] if len(models) == 1 else (
+            questionary.select("Which model?", choices=models).ask() or models[0])
+    else:
+        print("(couldn't list models from that URL — type the model name to use)")
+        model = questionary.text("Model name:").ask()
+        if not model or not model.strip():
+            return {}
+        model = model.strip()
+    return {"DISKSAGE_PROVIDER": "local",
+            "DISKSAGE_LOCAL_BASE_URL": base, "DISKSAGE_LOCAL_MODEL": model}
+
+
+def _setup_local(questionary) -> dict:
+    print("Scanning for local LLM servers…")
+    servers = llm.detect_local_servers()
+    if servers:
+        labels = [f"{s['name']}  —  {s['base_url']}  ({len(s['models'])} model(s))"
+                  for s in servers]
+        labels.append("Enter a custom URL…")
+        pick = questionary.select("Found these local servers:", choices=labels).ask()
+        if pick is None:
+            return {}
+        if pick.startswith("Enter a custom"):
+            return _custom_local(questionary)
+        s = servers[labels.index(pick)]
+        model = s["models"][0]
+        if len(s["models"]) > 1:
+            model = questionary.select("Which model?", choices=s["models"]).ask() or model
+        print(f"→ Using {s['name']} at {s['base_url']} with {model}")
+        return {"DISKSAGE_PROVIDER": "local",
+                "DISKSAGE_LOCAL_BASE_URL": s["base_url"], "DISKSAGE_LOCAL_MODEL": model}
+
+    print("No local server found on the usual ports.")
+    print("Start one first (e.g. `ollama serve`, LM Studio, or `llama-server`).")
+    if questionary.confirm("Enter a custom server URL instead?", default=False).ask():
+        return _custom_local(questionary)
+    return {}
+
+
+def cmd_doctor(args=None) -> int:
+    """Show the active provider and which local servers are reachable."""
+    print(f"Active AI provider: {llm.describe()}")
+    print("Scanning local ports (Ollama, LM Studio, llama.cpp, Jan, …)…")
+    servers = llm.detect_local_servers()
+    if not servers:
+        print("  no local OpenAI-compatible servers found on the usual ports.")
+        return 0
+    for s in servers:
+        shown = ", ".join(s["models"][:3]) + (" …" if len(s["models"]) > 3 else "")
+        print(f"  ✓ {s['name']}: {s['base_url']}  →  {shown}")
+    return 0
+
+
 def cmd_setup(args=None, first_run: bool = False) -> int:
     """Interactive first-run / re-run setup: pick an AI provider (or none) and,
     if needed, paste a key. Saved to the user config, never printed back."""
@@ -100,7 +164,7 @@ def cmd_setup(args=None, first_run: bool = False) -> int:
         choices=[
             "Groq — free cloud API (paste a key)",
             "Google Gemini — free cloud API (paste a key)",
-            "Local LM Studio — private, no key (needs the app running)",
+            "Local — auto-detect (Ollama, LM Studio, llama.cpp, …)",
             "No AI — use the built-in knowledge base only",
         ],
     ).ask()
@@ -113,20 +177,19 @@ def cmd_setup(args=None, first_run: bool = False) -> int:
         key = questionary.password(
             "Paste your Groq API key (free at console.groq.com):").ask()
         if key and key.strip():
-            values = {"GROQ_API_KEY": key.strip(),
+            values = {"DISKSAGE_PROVIDER": "groq", "GROQ_API_KEY": key.strip(),
                       "DISKSAGE_GROQ_MODEL": "openai/gpt-oss-20b"}
     elif choice.startswith("Google"):
         key = questionary.password(
             "Paste your Gemini API key (free at aistudio.google.com):").ask()
         if key and key.strip():
-            values = {"GEMINI_API_KEY": key.strip(),
+            values = {"DISKSAGE_PROVIDER": "gemini", "GEMINI_API_KEY": key.strip(),
                       "DISKSAGE_GEMINI_MODEL": "gemini-flash-latest"}
     elif choice.startswith("Local"):
-        values = {"DISKSAGE_PROVIDER": "local"}
-        print("→ Start LM Studio's local server (Developer tab) before running disksage.")
+        values = _setup_local(questionary)
 
     if not values:
-        # "No AI", or a key prompt left blank — record the choice so we don't ask again.
+        # "No AI", or a prompt left blank — record the choice so we don't ask again.
         values = {"DISKSAGE_AI": "off"}
 
     path = config.save(values)
@@ -450,6 +513,7 @@ def main(argv=None) -> int:
     sub = p.add_subparsers(dest="cmd", metavar="{scan,clean,setup}")
 
     sub.add_parser("setup", help="choose an AI provider and save your key")
+    sub.add_parser("doctor", help="show the active provider and detected local servers")
 
     for name in ("scan", "clean"):
         sp = sub.add_parser(name)
@@ -470,6 +534,8 @@ def main(argv=None) -> int:
 
     if args.cmd == "setup":
         return cmd_setup(args)
+    if args.cmd == "doctor":
+        return cmd_doctor(args)
 
     if getattr(args, "provider", None):
         os.environ["DISKSAGE_PROVIDER"] = args.provider

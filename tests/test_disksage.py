@@ -13,7 +13,7 @@ Run:  ./.venv/bin/python -m pytest -q
 import os
 import tempfile
 
-from disksage import dedup, knowledge, safety
+from disksage import dedup, knowledge, llm, safety
 from disksage.scan import dir_size
 
 HOME = os.path.expanduser("~")
@@ -85,6 +85,22 @@ def test_dedup_keeps_an_original(tmp_path):
     # group[0] is the kept original; only the rest are ever deletable.
     assert len(groups[0]) == 2
     assert len(groups[0][1:]) == 1
+
+
+# ---- local LLM provider resolution ----
+
+def test_local_provider_resolves_from_env(monkeypatch):
+    # An explicitly configured local server resolves without any network call
+    # (model provided), and takes priority when forced.
+    monkeypatch.setenv("DISKSAGE_PROVIDER", "local")
+    monkeypatch.setenv("DISKSAGE_LOCAL_BASE_URL", "http://localhost:11434/v1")
+    monkeypatch.setenv("DISKSAGE_LOCAL_MODEL", "llama3.1")
+    cfg = llm.resolve()
+    assert cfg is not None
+    assert cfg["name"] == "local"
+    assert cfg["base_url"].endswith("11434/v1")
+    assert cfg["model"] == "llama3.1"
+    assert cfg["api_key"] == "local"
 
 
 # ---- non-overlapping sizing ----

@@ -79,7 +79,7 @@ def _totals(items) -> dict[str, int]:
     return out
 
 
-def cmd_setup(args=None) -> int:
+def cmd_setup(args=None, first_run: bool = False) -> int:
     """Interactive first-run / re-run setup: pick an AI provider (or none) and,
     if needed, paste a key. Saved to the user config, never printed back."""
     if not sys.stdin.isatty():
@@ -131,21 +131,25 @@ def cmd_setup(args=None) -> int:
 
     path = config.save(values)
     print(f"\nSaved to {path}")
-    print(f"AI provider now: {llm.describe()}")
-    print("Run `disksage scan` to see where your space went.")
+    print(f"AI provider: {llm.describe()}")
+    if not first_run:
+        print("\nNext:  disksage scan   (report where space went)")
+        print("       disksage clean  (pick items to free up)")
     return 0
 
 
 def _maybe_first_run_setup(args) -> None:
-    """On the very first interactive run, offer setup once."""
+    """On the very first interactive run, offer setup once, then continue into
+    the scan the user asked for (fastest path to value)."""
     if config.is_configured() or getattr(args, "no_ai", False):
         return
     if not sys.stdin.isatty():
         return
     print("👋 Welcome to disksage — quick one-time setup.\n")
-    cmd_setup()
+    cmd_setup(first_run=True)
     config.load()
-    print()
+    print("\nSetup complete — running your first scan now.")
+    print("(next time: `disksage scan` to report, `disksage clean` to free space)\n")
 
 
 def _print_provider_banner(con) -> None:
@@ -418,9 +422,18 @@ def cmd_clean(args) -> int:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         prog="disksage",
-        description="AI-aware disk cleaner that never deletes without asking.")
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="AI-aware disk cleaner that never deletes without asking.",
+        epilog=(
+            "examples:\n"
+            "  disksage              scan and report (deletes nothing)\n"
+            "  disksage scan         same as above\n"
+            "  disksage clean        pick items from a checklist to move to Trash\n"
+            "  disksage setup        choose an AI provider / paste a key\n"
+            "  disksage clean --min-size 5 --no-ai\n"
+        ))
     p.add_argument("--version", action="version", version=f"disksage {__version__}")
-    sub = p.add_subparsers(dest="cmd")
+    sub = p.add_subparsers(dest="cmd", metavar="{scan,clean,setup}")
 
     sub.add_parser("setup", help="choose an AI provider and save your key")
 

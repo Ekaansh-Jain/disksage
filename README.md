@@ -30,6 +30,12 @@ scan  →  AI identifies & explains  →  safety floor  →  you review  →  Tr
 The AI proposes; the safety floor disposes. The tool runs fully **without any
 AI** — it just falls back to the knowledge base.
 
+## Requirements
+
+- **macOS** (the path knowledge targets macOS layouts)
+- **Python 3.9+** (`python3 --version`)
+- Optionally an AI key (Groq/Gemini) or LM Studio — the tool works without one too
+
 ## Install
 
 The recommended way (installs the `disksage` command in its own isolated env):
@@ -37,6 +43,9 @@ The recommended way (installs the `disksage` command in its own isolated env):
 ```bash
 pipx install git+https://github.com/Ekaansh-Jain/disksage.git
 ```
+
+Don't have `pipx`? Install it once with `brew install pipx && pipx ensurepath`
+(or use plain `pip` below). Then just run `disksage`.
 
 Or from a local clone:
 
@@ -147,6 +156,20 @@ Designed so it's safe for anyone to run on their own machine:
 macOS-focused (the knowledge base and protected paths target macOS layouts).
 It won't harm other systems — it just finds less — but Linux/Windows support
 means extending `knowledge.py` and `safety.py`.
+
+## Contributing
+
+The heart of the project is the **knowledge base** (`disksage/knowledge.py`) —
+the list of "what is this folder and is it safe to delete." The easiest and most
+valuable contribution is teaching it a new path:
+
+1. Fork and clone, then `python3 -m pip install -e ".[dev]"`.
+2. Add a `Rule(...)` in `knowledge.py` for the cache/app you know about.
+3. Run the tests: `python3 -m pytest -q` (they enforce the safety guarantees).
+4. Open a pull request.
+
+Please keep the safety rules intact — anything uncertain should be tagged
+`review`, never `safe`, and protected paths in `safety.py` must stay protected.
 
 ## License
 

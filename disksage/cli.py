@@ -231,13 +231,22 @@ def cmd_scan(args) -> int:
         print("Nothing above the size threshold. Try --min-size 5.")
         return 0
     _print_report(items, con)
+
+    legend = ("Legend  🤖 = labelled by AI (others from the built-in list)   ·   "
+              "SAFE regenerates on its own   ·   REVIEW check first   ·   "
+              "KEEP left alone")
+    con.print(f"[dim]{legend}[/dim]") if con else print(legend)
+
     t = _totals(items)
     msg = (f"\nReclaimable now → safe: {human(t['safe'])}   "
            f"duplicates: {human(t['duplicate'])}   review: {human(t['review'])}   "
            f"(keep: {human(t['keep'])})\n"
            f"Disk: {_free_space()}")
     con.print(msg) if con else print(msg)
-    print("\nRun `disksage clean` to move approved items to the Trash (reversible).")
+
+    hint = ("\nThis was a read-only report — nothing was deleted.\n"
+            "→ Run `disksage clean` to pick items from a checklist and free space.")
+    con.print(f"[bold]{hint}[/bold]") if con else print(hint)
     return 0
 
 

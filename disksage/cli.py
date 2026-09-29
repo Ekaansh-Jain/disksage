@@ -369,6 +369,11 @@ def _select_prompts(actionable):
 
 def cmd_clean(args) -> int:
     con = _console()
+    intro = ("disksage clean — you'll get a checklist to tick what to remove.\n"
+             "Nothing is deleted until you review the final list and type 'yes', "
+             "and everything goes to the Trash (recoverable).")
+    con.print(f"[bold]{intro}[/bold]\n") if con else print(intro + "\n")
+
     items = _scan_and_classify(args, con)
     actionable = [i for i in items if i.tier in ("safe", "duplicate", "review")]
 

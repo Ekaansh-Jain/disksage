@@ -386,19 +386,25 @@ def _select_tui(actionable):
     ])
 
     ordered = sorted(actionable, key=lambda i: (TIER_ORDER.get(i.tier, 3), -i.size))
+    tier_totals: dict[str, int] = {}
+    for it in ordered:
+        tier_totals[it.tier] = tier_totals.get(it.tier, 0) + it.size
+
     choices = []
     last_tier = None
     for it in ordered:
         if it.tier != last_tier:
             if last_tier is not None:
                 choices.append(Separator(" "))
-            choices.append(Separator(f"── {_TIER_HEADINGS.get(it.tier, it.tier.upper())} ──"))
+            heading = _TIER_HEADINGS.get(it.tier, it.tier.upper())
+            choices.append(Separator(f"── {heading}  ·  {human(tier_totals[it.tier])} ──"))
             last_tier = it.tier
         choices.append(Choice(title=_choice_title(it, path_budget), value=it,
                               checked=_default_checked(it)))
 
+    grand = human(sum(i.size for i in ordered))
     selected = questionary.checkbox(
-        "Select what to move to Trash:",
+        f"Select what to move to Trash  ·  {len(ordered)} items, up to {grand} reclaimable:",
         choices=choices,
         pointer="❯",
         instruction="(↑↓ move · space = tick · a = all · i = invert · enter = confirm)",

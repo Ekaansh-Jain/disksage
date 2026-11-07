@@ -722,14 +722,26 @@ def _buckets(result: ScanResult) -> tuple[list[Bucket], list]:
     return buckets, kept
 
 
-def _item_note(it) -> str:
+def _item_notes(it) -> list[str]:
+    """A short note for the biggest-items list, longest wording first."""
     if it.kind == "duplicate" and it.original:
-        return f"same as {_short_path(it.original)}"
+        return [f"same as {_short_path(it.original)}", "duplicate"]
     if getattr(it, "tracked", 0):
-        return "tracked by git"
+        return ["tracked by git"]
     if it.touched and os.path.basename(it.path) in REBUILDABLE:
-        return f"last touched {_ago(it.touched)}"
-    return ""
+        return [f"last touched {_ago(it.touched)}", _ago(it.touched)]
+    return []
+
+
+def _path_and_note(it, room: int) -> tuple[str, str]:
+    """Fit a path and its note into `room` columns. The path matters more (it
+    says which project or cache), so the note gets shorter, then disappears,
+    before the path is shortened."""
+    path = _display_path(it)
+    for note in _item_notes(it):
+        if len(path) + len(note) + 3 <= room:
+            return path, note
+    return _fit(path, room), ""
 
 
 def _print_summary(result: ScanResult, con, top: int = 8) -> None:
@@ -767,9 +779,7 @@ def _print_summary(result: ScanResult, con, top: int = 8) -> None:
         _say(con, "\n[bold]Biggest items[/bold]", "\nBiggest items")
         for it in biggest:
             label = it.label if len(it.label) <= 24 else it.label[:23] + "…"
-            note = _item_note(it)
-            budget = width - 42 - (len(note) + 3 if note else 0)
-            path = _fit(_display_path(it), max(20, budget))
+            path, note = _path_and_note(it, max(24, width - 42))
             _say(con, f"  {human(it.size):>10}  {label:<24}  {path}"
                       + (f" [dim]· {note}[/dim]" if note else ""),
                  f"  {human(it.size):>10}  {label:<24}  {path}" + (f" · {note}" if note else ""))

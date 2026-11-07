@@ -1042,3 +1042,16 @@ def test_long_paths_keep_whole_folder_names_and_the_project():
                           40), ("~/x/an-extremely-long-single-folder-name-here", 20)):
         shortened = cli._fit(path, budget)
         assert len(shortened) <= budget and shortened.startswith(("~", "…"))
+
+
+def test_notes_shrink_before_paths_do():
+    import time
+
+    from disksage.scan import Item
+    it = Item(path=os.path.join(HOME, "Projects/old-react-app/node_modules"), size=1,
+              touched=time.time() - 270 * 86400)
+    assert cli._path_and_note(it, 80) == ("~/Projects/old-react-app/node_modules",
+                                          "last touched 9 months ago")
+    assert cli._path_and_note(it, 54) == ("~/Projects/old-react-app/node_modules", "9 months ago")
+    assert cli._path_and_note(it, 37) == ("~/Projects/old-react-app/node_modules", "")
+    assert cli._path_and_note(it, 30) == ("…/old-react-app/node_modules", "")

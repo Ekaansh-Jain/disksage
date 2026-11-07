@@ -13,6 +13,7 @@ Run:  ./.venv/bin/python -m pytest -q
 import hashlib
 import json
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -604,6 +605,44 @@ def test_choosing_a_provider_after_no_ai_turns_the_ai_back_on(user_config):
     assert llm.resolve() is None
     config.save({"DISKSAGE_PROVIDER": "groq", "GROQ_API_KEY": "gsk_test"})
     assert llm.resolve()["name"] == "groq"
+
+
+def test_the_key_file_is_private_from_the_moment_it_exists(user_config, monkeypatch):
+    # Writing the key first and running chmod afterwards leaves a moment where
+    # other accounts on the Mac can read it, so nothing may depend on chmod.
+    monkeypatch.setattr(os, "chmod", lambda *a, **k: None)
+    monkeypatch.setattr(os, "fchmod", lambda *a, **k: None)
+    old_umask = os.umask(0o022)                     # the usual default: new files readable by all
+    try:
+        path = config.save({"DISKSAGE_PROVIDER": "groq", "GROQ_API_KEY": "gsk_test"})
+    finally:
+        os.umask(old_umask)
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    assert stat.S_IMODE(os.stat(config.CONFIG_DIR).st_mode) == 0o700
+    assert "GROQ_API_KEY=gsk_test" in user_config.read_text()
+    assert os.listdir(config.CONFIG_DIR) == [".env"]  # no temporary file left behind
+
+
+def test_saving_replaces_a_config_that_others_could_read(user_config):
+    user_config.parent.mkdir(parents=True)
+    user_config.write_text("GROQ_API_KEY=old\n")
+    os.chmod(user_config, 0o644)                    # written by hand, or by an older version
+    config.save({"DISKSAGE_PROVIDER": "groq", "GROQ_API_KEY": "new"})
+    assert stat.S_IMODE(os.stat(user_config).st_mode) == 0o600
+    assert "GROQ_API_KEY=new" in user_config.read_text()
+
+
+def test_a_symlinked_config_stays_a_symlink(user_config, tmp_path):
+    # Dotfile managers such as stow and chezmoi link config files into place.
+    real = tmp_path / "dotfiles" / "disksage.env"
+    real.parent.mkdir()
+    real.write_text("DISKSAGE_AI=off\n")
+    user_config.parent.mkdir(parents=True)
+    user_config.symlink_to(real)
+    config.save({"DISKSAGE_PROVIDER": "groq", "GROQ_API_KEY": "gsk_test"})
+    assert user_config.is_symlink()
+    assert "GROQ_API_KEY=gsk_test" in real.read_text()
+    assert stat.S_IMODE(os.stat(real).st_mode) == 0o600
 
 
 # ---- results first, and only stale project folders pre-ticked ----

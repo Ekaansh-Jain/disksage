@@ -11,6 +11,7 @@ back. Nothing is ever sent anywhere except the AI provider they chose.
 
 from __future__ import annotations
 
+import contextlib
 import os
 
 CONFIG_DIR = os.path.expanduser("~/.config/disksage")
@@ -35,17 +36,24 @@ def is_configured() -> bool:
 def save(values: dict[str, str]) -> str:
     """Write config values (creating the dir), apply them to this process, and
     return the file path. Overwrites any previous config."""
-    os.makedirs(CONFIG_DIR, exist_ok=True)
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
     body = "# disksage configuration — created by `disksage setup`\n"
     body += "# You can edit this file by hand; keep it private.\n"
     for k, v in values.items():
         body += f"{k}={v}\n"
-    with open(ENV_PATH, "w") as f:
-        f.write(body)
+    # The key goes into a new file that only you can read, which then replaces
+    # the old one. Writing first and running chmod afterwards would leave a
+    # moment where other accounts on the Mac could read it.
+    target = os.path.realpath(ENV_PATH)  # a symlinked config (dotfiles) stays a symlink
+    tmp = f"{target}.{os.getpid()}.tmp"
     try:
-        os.chmod(ENV_PATH, 0o600)   # keys are readable only by the user
-    except OSError:
-        pass
+        with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+            f.write(body)
+        os.replace(tmp, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
     if "DISKSAGE_AI" not in values:
         os.environ.pop("DISKSAGE_AI", None)  # a provider was chosen: the AI is on again
     for k, v in values.items():

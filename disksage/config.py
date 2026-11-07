@@ -46,6 +46,8 @@ def save(values: dict[str, str]) -> str:
         os.chmod(ENV_PATH, 0o600)   # keys are readable only by the user
     except OSError:
         pass
+    if "DISKSAGE_AI" not in values:
+        os.environ.pop("DISKSAGE_AI", None)  # a provider was chosen: the AI is on again
     for k, v in values.items():
         os.environ[k] = v
     return ENV_PATH

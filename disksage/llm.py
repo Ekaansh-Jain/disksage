@@ -6,8 +6,12 @@ so one standard-library HTTP request covers them all: we just swap the base
 URL + model. "Supporting a local LLM" is therefore just pointing at the right
 localhost port + model.
 
-Provider is chosen by DISKSAGE_PROVIDER, else auto-detected in this order:
-    local (any detected server)  ->  groq  ->  gemini
+The provider is the one named in DISKSAGE_PROVIDER, which `disksage setup`
+saves and --provider sets for one run. Without it, only a local server is
+auto-detected: a Groq or Gemini key that happens to be set in the shell (for
+another tool) is never used on its own, so nothing leaves the Mac unless the
+user picked a cloud provider. DISKSAGE_AI=off, which "No AI" in setup saves,
+turns the AI off completely.
 
 The tool works with NO provider at all — classify.py falls back to the
 knowledge base and tags anything unknown as "review". The LLM only ever
@@ -103,26 +107,35 @@ def _resolve_local() -> dict | None:
     return None
 
 
-def resolve() -> dict | None:
-    """Pick a usable provider config, or None if nothing is available."""
-    forced = os.environ.get("DISKSAGE_PROVIDER", "").strip().lower()
-    order = [forced] if forced else ["local", "groq", "gemini"]
+# "No AI" in setup saves DISKSAGE_AI=off; a hand-edited file may say false, 0 or no.
+_OFF_VALUES = {"off", "0", "false", "no", "none"}
 
-    for name in order:
-        if name == "local":
-            cfg = _resolve_local()
-            if cfg:
-                return cfg
-        elif name in PROVIDERS:
-            p = PROVIDERS[name]
-            key = os.environ.get(p["api_key_env"], "")
-            if key:
-                return {"name": name, "base_url": p["base_url"],
-                        "api_key": key, "model": p["model"]}
-    return None
+
+def ai_off() -> bool:
+    """True when the user chose "No AI": nothing is sent anywhere, even if a
+    local server is running or a key is set."""
+    return os.environ.get("DISKSAGE_AI", "").strip().lower() in _OFF_VALUES
+
+
+def resolve() -> dict | None:
+    """The provider the user chose, else a local server; None if neither."""
+    if ai_off():
+        return None
+    chosen = os.environ.get("DISKSAGE_PROVIDER", "").strip().lower()
+    if chosen in ("", "local"):
+        return _resolve_local()
+    p = PROVIDERS.get(chosen)
+    if p is None:
+        return None
+    key = os.environ.get(p["api_key_env"], "")
+    if not key:
+        return None
+    return {"name": chosen, "base_url": p["base_url"], "api_key": key, "model": p["model"]}
 
 
 def describe() -> str:
+    if ai_off():
+        return "off (built-in list only)"
     cfg = resolve()
     return f"{cfg['name']} ({cfg['model']})" if cfg else "none (knowledge base only)"
 

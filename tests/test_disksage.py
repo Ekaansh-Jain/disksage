@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from disksage import cli, dedup, knowledge, llm, models, safety
+from disksage import cli, config, dedup, knowledge, llm, models, safety
 from disksage.classify import build_file_items
 from disksage.scan import collect_files, dir_size, is_dataless, scan_dirs, size_on_disk
 from disksage.tools import docker_report as real_docker_report  # conftest stubs the module's
@@ -507,6 +507,86 @@ def test_chat_json_unreachable_server(monkeypatch):
     monkeypatch.setenv("DISKSAGE_LOCAL_MODEL", "m")
     res = llm.chat_json("system", "user", timeout=2)
     assert res.content is None and "reach" in res.error
+
+
+# ---- the AI runs only when you chose it ----
+
+def _unset(monkeypatch, *names):
+    """Unset these for one test, and restore them afterwards even when the code
+    under test sets them (config.load and config.save write to os.environ)."""
+    for name in names:
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+
+
+@pytest.fixture
+def user_config(monkeypatch, tmp_path):
+    """disksage's settings file in a throwaway folder, no AI settings in the
+    environment, and no local model server running."""
+    folder = tmp_path / "config" / "disksage"
+    monkeypatch.setattr(config, "CONFIG_DIR", str(folder))
+    monkeypatch.setattr(config, "ENV_PATH", str(folder / ".env"))
+    _unset(monkeypatch, "DISKSAGE_AI", "DISKSAGE_PROVIDER", "DISKSAGE_LOCAL_BASE_URL",
+           "DISKSAGE_LOCAL_MODEL", "LMSTUDIO_BASE_URL", "GROQ_API_KEY", "GEMINI_API_KEY")
+    monkeypatch.setattr(llm, "_LOCAL_CACHE", [])
+    return folder / ".env"
+
+
+@pytest.mark.parametrize("value", ["off", "OFF", "0", "false", "no"])
+def test_no_ai_turns_every_provider_off(user_config, monkeypatch, value):
+    # "No AI" in setup saves DISKSAGE_AI=off. A saved provider, a key in the
+    # shell or a configured local server must not switch the AI back on.
+    monkeypatch.setenv("DISKSAGE_AI", value)
+    monkeypatch.setenv("DISKSAGE_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "from-the-shell")
+    monkeypatch.setenv("DISKSAGE_LOCAL_BASE_URL", "http://127.0.0.1:9/v1")
+    monkeypatch.setenv("DISKSAGE_LOCAL_MODEL", "m")
+    assert llm.resolve() is None
+    assert llm.describe().startswith("off")
+
+
+def test_a_cloud_key_in_the_shell_is_used_only_for_the_provider_you_chose(user_config, monkeypatch):
+    # Many developers export GEMINI_API_KEY or GROQ_API_KEY for other tools.
+    monkeypatch.setenv("GEMINI_API_KEY", "for-another-tool")
+    monkeypatch.setenv("GROQ_API_KEY", "for-another-tool")
+    assert llm.resolve() is None
+    monkeypatch.setenv("DISKSAGE_PROVIDER", "groq")       # what setup saves with the key
+    assert llm.resolve()["name"] == "groq"
+
+
+def test_after_no_ai_a_scan_sends_nothing_and_does_not_ask_again(user_config, monkeypatch,
+                                                                capsys):
+    _make(os.path.join(HOME, "Library/Application Support/StealthStartup/blob.bin"),
+          os.urandom(3 * MB))
+    user_config.parent.mkdir(parents=True)
+    user_config.write_text("DISKSAGE_AI=off\n")           # what "No AI" in setup saves
+    monkeypatch.setenv("DISKSAGE_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "from-the-shell")
+    monkeypatch.setattr(cli, "annotate_with_ai", lambda items: pytest.fail("the AI was asked"))
+    monkeypatch.setattr(llm, "chat_json", lambda *a, **k: pytest.fail("something was sent"))
+    assert cli.main(["scan", "--no-files", "--min-size", "1"]) == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "StealthStartup" in out
+    assert "lets an AI identify them" not in out
+
+
+def test_asking_for_a_provider_turns_the_ai_on_for_that_run(user_config, monkeypatch, local_ai):
+    _make(os.path.join(HOME, "Library/Application Support/AskedForAI/blob.bin"),
+          os.urandom(3 * MB))
+    local_ai("/ok/v1")
+    monkeypatch.setenv("DISKSAGE_AI", "off")
+    asked = []
+    real = cli.annotate_with_ai
+    monkeypatch.setattr(cli, "annotate_with_ai", lambda items: asked.append(items) or real(items))
+    assert cli.main(["scan", "--no-files", "--min-size", "1", "--provider", "local"]) == 0
+    assert asked
+
+
+def test_choosing_a_provider_after_no_ai_turns_the_ai_back_on(user_config):
+    config.save({"DISKSAGE_AI": "off"})
+    assert llm.resolve() is None
+    config.save({"DISKSAGE_PROVIDER": "groq", "GROQ_API_KEY": "gsk_test"})
+    assert llm.resolve()["name"] == "groq"
 
 
 # ---- results first, and only stale project folders pre-ticked ----

@@ -511,7 +511,8 @@ def _scan(args, con) -> ScanResult:
         items=items, files_seen=progress.files, seconds=progress.seconds,
         cloud_only_files=walk.cloud_only_files, cloud_only_bytes=walk.cloud_only_bytes,
         unknown_count=len(still_unknown), unknown_bytes=sum(i.size for i in still_unknown),
-        suggest_setup=bool(still_unknown) and not args.no_ai and provider is None,
+        suggest_setup=(bool(still_unknown) and not args.no_ai and provider is None
+                       and not llm.ai_off()),  # after "No AI", don't ask again
         docker=docker, dupes=dupes, options=_scan_options(args))
     _say(con, f"[dim]Scanned {progress.files:,} files in {_seconds(progress.seconds)}.[/dim]",
          f"Scanned {progress.files:,} files in {_seconds(progress.seconds)}.")
@@ -1335,6 +1336,7 @@ def _run(p, args) -> int:
 
     if getattr(args, "provider", None):
         os.environ["DISKSAGE_PROVIDER"] = args.provider
+        os.environ.pop("DISKSAGE_AI", None)  # asking for a provider turns the AI on for this run
 
     # No subcommand: in a terminal, the whole flow (scan → summary → clean);
     # when piped, the read-only report.

@@ -227,11 +227,15 @@ def pick_keeper(group: list[ModelFile]) -> ModelFile:
 # ---- remembering clones ----
 
 def _inode_key(path: str) -> str | None:
+    """device:inode:size:mtime. The inode alone isn't enough: when a file is
+    deleted, the filesystem may hand its inode number straight to the next new
+    file (ext4 does), and a re-downloaded model would look already shared.
+    A re-download also gets a new mtime; `dedupe` keeps the mtime it found."""
     try:
         st = os.stat(path)
     except OSError:
         return None
-    return f"{st.st_dev}:{st.st_ino}"
+    return f"{st.st_dev}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}"
 
 
 def load_clones() -> dict[str, dict]:

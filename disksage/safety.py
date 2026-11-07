@@ -26,7 +26,11 @@ from fnmatch import fnmatch
 
 from .scan import is_package
 
-HOME = os.path.expanduser("~")
+# Resolved, because every check below compares resolved paths (and so do the
+# protected paths built from it). If HOME sits behind a symlink (macOS temp
+# folders live under /var -> /private/var), an unresolved HOME made every path
+# look "outside your home", so nothing could be cleaned at all.
+HOME = os.path.realpath(os.path.expanduser("~"))
 
 # Paths that must never be removed, even if the AI tags them "safe".
 PROTECTED_GLOBS = [

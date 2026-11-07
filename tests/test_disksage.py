@@ -576,12 +576,13 @@ def test_scan_shows_results_and_suggests_setup_instead_of_asking(monkeypatch, ca
 # ---- local models: the same file stored by several apps ----
 
 @pytest.fixture
-def model_stores(monkeypatch, tmp_path):
+def model_stores(monkeypatch):
     """The same 3 MB "model" downloaded by Ollama, Hugging Face and LM Studio,
-    in a home folder of its own."""
+    in a folder of its own inside the (fake) home, so `dedupe`'s safety floor
+    lets it through."""
     for var in ("HF_HOME", "HF_HUB_CACHE", "OLLAMA_MODELS"):
         monkeypatch.delenv(var, raising=False)
-    home = str(tmp_path)
+    home = tempfile.mkdtemp(dir=HOME, prefix="models-")
     monkeypatch.setattr(models, "HOME", home)
     monkeypatch.setattr(models, "STATE_DIR", os.path.join(home, ".local/state/disksage"))
     monkeypatch.setattr(models, "CLONES_FILE", os.path.join(home, ".local/state/disksage/clones.json"))
@@ -661,10 +662,34 @@ def test_clone_records_follow_the_files(tmp_path):
     mk = models.ModelFile("huggingface", keep, 100, None)
     mc = models.ModelFile("lmstudio", copy, 100, None)
     assert models.already_shared(records, mk, mc)
-    # The app re-downloads the file: new inode, so it's a full duplicate again.
+    # The app re-downloads the file. Even if the filesystem reuses the inode
+    # number (ext4 does), the new file has a new mtime: a full duplicate again.
     os.remove(copy)
     _make(copy, b"k" * 100)
+    os.utime(copy, (1_700_000_000, 1_700_000_000))
     assert not models.already_shared(records, mk, mc)
+
+
+def test_safety_floor_works_when_home_is_behind_a_symlink(tmp_path):
+    """macOS temp folders live under /var -> /private/var. Run in a fresh
+    interpreter so disksage builds its paths from the symlinked HOME."""
+    import subprocess
+    real_home = tmp_path / "real-home"
+    (real_home / "Documents").mkdir(parents=True)
+    (real_home / "Library/Caches/pip").mkdir(parents=True)
+    linked_home = tmp_path / "linked-home"
+    os.symlink(real_home, linked_home)
+    code = (
+        "import json, os\n"
+        "from disksage import safety\n"
+        "h = os.path.expanduser('~')\n"
+        "print(json.dumps([safety.is_safe_to_trash(os.path.join(h, 'Library/Caches/pip'))[0],\n"
+        "                  safety.is_safe_to_trash(os.path.join(h, 'Documents'))[0]]))\n")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True,
+                         env={**os.environ, "HOME": str(linked_home)}).stdout
+    cache_allowed, documents_allowed = json.loads(out)
+    assert cache_allowed is True        # inside home, even though HOME is a symlink
+    assert documents_allowed is False   # protected top-level folder stays protected
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="needs macOS and APFS")

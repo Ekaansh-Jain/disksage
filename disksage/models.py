@@ -56,6 +56,15 @@ class ModelFile:
     sha256: str | None           # from the file name when the app names files by hash
     names: tuple[str, ...] = ()  # models that use this file, where known
     on_disk: int = 0             # bytes allocated
+    file_name: str = ""          # the name people know it by, e.g. model-Q4_K_M.gguf
+
+    @property
+    def title(self) -> str:
+        """How to show this file to a person: the model, then its file name.
+        Hugging Face and Ollama store files under 64-character hashes, which
+        mean nothing to anyone."""
+        name = ", ".join(self.names) if self.names else "(not used by any model)"
+        return f"{name} · {self.file_name}" if self.file_name else name
 
 
 def model_dirs(home: str | None = None) -> dict[str, str]:
@@ -69,7 +78,7 @@ def model_dirs(home: str | None = None) -> dict[str, str]:
     }
 
 
-def _model_file(store, path, digest, names, min_size) -> ModelFile | None:
+def _model_file(store, path, digest, names, min_size, file_name="") -> ModelFile | None:
     try:
         st = os.stat(path)
     except OSError:
@@ -77,7 +86,20 @@ def _model_file(store, path, digest, names, min_size) -> ModelFile | None:
     if not stat.S_ISREG(st.st_mode) or st.st_size < min_size:
         return None
     return ModelFile(store, os.path.realpath(path), st.st_size, digest, tuple(names),
-                     size_on_disk(st))
+                     size_on_disk(st), file_name)
+
+
+def _snapshot_names(repo_dir: str) -> dict[str, str]:
+    """Hugging Face keeps readable names only in snapshots/<revision>/, as
+    symlinks to the hash-named blobs. Map each blob's real path to its name."""
+    names: dict[str, str] = {}
+    snapshots = os.path.join(repo_dir, "snapshots")
+    for dirpath, _, filenames in os.walk(snapshots):
+        for filename in filenames:
+            link = os.path.join(dirpath, filename)
+            if os.path.islink(link):
+                names.setdefault(os.path.realpath(link), filename)
+    return names
 
 
 def ollama_files(models_dir: str, min_size: int = 0) -> list[ModelFile]:
@@ -131,10 +153,12 @@ def huggingface_files(hub_dir: str, min_size: int = 0) -> list[ModelFile]:
             names = os.listdir(blobs)
         except OSError:
             continue
+        readable = _snapshot_names(os.path.join(hub_dir, repo))
         for name in names:
             if _HEX64.fullmatch(name):  # 40-hex names are small git files, not weights
-                mf = _model_file("huggingface", os.path.join(blobs, name), name, (model,),
-                                 min_size)
+                blob = os.path.join(blobs, name)
+                mf = _model_file("huggingface", blob, name, (model,), min_size,
+                                 readable.get(os.path.realpath(blob), ""))
                 if mf:
                     found.append(mf)
     return found
@@ -147,7 +171,7 @@ def lmstudio_files(models_dir: str, min_size: int = 0) -> list[ModelFile]:
             if filename.lower().endswith((".gguf", ".safetensors")):
                 model = os.path.relpath(dirpath, models_dir).replace(os.sep, "/")
                 mf = _model_file("lmstudio", os.path.join(dirpath, filename), None, (model,),
-                                 min_size)
+                                 min_size, filename)
                 if mf:
                     found.append(mf)
     return found
@@ -168,36 +192,48 @@ def all_model_files(min_size: int = 50 * 1024 * 1024) -> list[ModelFile]:
         key = (st.st_dev, st.st_ino)
         if key in unique:  # the same file reached twice (symlinks, hard links)
             unique[key].names = tuple(dict.fromkeys(unique[key].names + f.names))
+            unique[key].file_name = unique[key].file_name or f.file_name
         else:
             unique[key] = f
     return sorted(unique.values(), key=lambda f: -f.size)
 
 
-def sha256_file(path: str, chunk: int = 8 * 1024 * 1024) -> str:
+def sha256_file(path: str, chunk: int = 8 * 1024 * 1024, on_bytes=None) -> str:
+    """SHA-256 of a file. `on_bytes(n)` is called as it reads, for progress bars."""
     digest = hashlib.sha256()
     with open(path, "rb") as f:
         for block in iter(lambda: f.read(chunk), b""):
             digest.update(block)
+            if on_bytes:
+                on_bytes(len(block))
     return digest.hexdigest()
 
 
-def find_model_duplicates(files: list[ModelFile]) -> list[list[ModelFile]]:
+def _same_size_groups(files: list[ModelFile]) -> list[list[ModelFile]]:
+    by_size: dict[int, list[ModelFile]] = {}
+    for f in files:
+        by_size.setdefault(f.size, []).append(f)
+    return [group for group in by_size.values() if len(group) > 1]
+
+
+def files_to_hash(files: list[ModelFile]) -> list[ModelFile]:
+    """The files find_model_duplicates() will have to read: unknown hash, and a
+    size shared with another file. Lets the caller size a progress bar."""
+    return [f for group in _same_size_groups(files) for f in group if f.sha256 is None]
+
+
+def find_model_duplicates(files: list[ModelFile], on_bytes=None) -> list[list[ModelFile]]:
     """Groups of identical model files.
 
     Files named by hash match for free. A file with an unknown hash is only read
     when its size equals another file's, so most gigabytes are never hashed.
     Hard links and symlinks to the same file collapse to one entry."""
-    by_size: dict[int, list[ModelFile]] = {}
-    for f in files:
-        by_size.setdefault(f.size, []).append(f)
     by_hash: dict[str, list[ModelFile]] = {}
-    for same_size in by_size.values():
-        if len(same_size) < 2:
-            continue
+    for same_size in _same_size_groups(files):
         for f in same_size:
             if f.sha256 is None:
                 try:
-                    f.sha256 = sha256_file(f.path)
+                    f.sha256 = sha256_file(f.path, on_bytes=on_bytes)
                 except OSError:
                     continue
             by_hash.setdefault(f.sha256, []).append(f)
@@ -222,6 +258,65 @@ def pick_keeper(group: list[ModelFile]) -> ModelFile:
     """The copy that stays exactly as it is. Hugging Face's copy may be shared
     by several repos, so it's never the one replaced; Ollama's comes next."""
     return min(group, key=lambda f: (_KEEP_ORDER.get(f.store, 9), f.path))
+
+
+@dataclass(frozen=True)
+class DuplicateEstimate:
+    groups: int        # models stored more than once
+    reclaimable: int   # bytes `dedupe` could give back
+    exact: bool        # False if some matches are by size alone (not yet hashed)
+
+
+def estimate_duplicates(files: list[ModelFile],
+                        records: dict[str, dict] | None = None) -> DuplicateEstimate:
+    """What `dedupe` could reclaim, without reading a single file, so `scan`
+    stays fast. Files named by hash group by that hash. A file whose hash is
+    unknown (LM Studio) joins the hash group of the same size, or groups with
+    other unknown files of the same size. Byte-identical sizes in the gigabytes
+    are a strong hint; `dedupe` checks every file's hash before changing it."""
+    records = load_clones() if records is None else records
+    hashed: dict[int, dict[str, list[ModelFile]]] = {}
+    unknown: dict[int, list[ModelFile]] = {}
+    for f in files:
+        if f.sha256:
+            hashed.setdefault(f.size, {}).setdefault(f.sha256, []).append(f)
+        else:
+            unknown.setdefault(f.size, []).append(f)
+    groups: list[list[ModelFile]] = []
+    exact = True
+    for size, by_hash in hashed.items():
+        hash_groups = list(by_hash.values())
+        loose = unknown.pop(size, [])
+        if loose:
+            exact = False
+            if len(hash_groups) == 1:
+                hash_groups[0] = hash_groups[0] + loose
+            else:
+                hash_groups.append(loose)  # can't tell which hash they match
+        groups.extend(hash_groups)
+    for loose in unknown.values():
+        if len(loose) > 1:
+            exact = False
+            groups.append(loose)
+
+    count = reclaimable = 0
+    for group in groups:
+        unique: dict[tuple[int, int], ModelFile] = {}
+        for f in group:
+            try:
+                st = os.stat(f.path)
+            except OSError:
+                continue
+            unique.setdefault((st.st_dev, st.st_ino), f)
+        if len(unique) < 2:
+            continue
+        copies = list(unique.values())
+        keep = pick_keeper(copies)
+        todo = [f for f in copies if f is not keep and not already_shared(records, keep, f)]
+        if todo:
+            count += 1
+            reclaimable += sum(f.on_disk for f in todo)
+    return DuplicateEstimate(count, reclaimable, exact)
 
 
 # ---- remembering clones ----
@@ -284,7 +379,7 @@ def _clonefile(src: str, dst: str) -> None:
         raise OSError(err, os.strerror(err), dst)
 
 
-def replace_with_clone(keep: str, duplicate: str) -> int:
+def replace_with_clone(keep: str, duplicate: str, on_bytes=None) -> int:
     """Turn `duplicate` into an APFS clone of `keep`. Both paths keep working and
     the duplicate's own blocks are freed.
 
@@ -300,7 +395,9 @@ def replace_with_clone(keep: str, duplicate: str) -> int:
         return 0  # clones only work within one volume
     if (keep_st.st_dev, keep_st.st_ino) == (dup_st.st_dev, dup_st.st_ino) or dup_st.st_nlink > 1:
         return 0  # the same file, or other hard links keep the bytes alive anyway
-    if keep_st.st_size != dup_st.st_size or sha256_file(keep) != sha256_file(duplicate):
+    if keep_st.st_size != dup_st.st_size:
+        return 0
+    if sha256_file(keep, on_bytes=on_bytes) != sha256_file(duplicate, on_bytes=on_bytes):
         return 0
     tmp = os.path.join(os.path.dirname(duplicate),
                        f".{os.path.basename(duplicate)}.disksage-clone")

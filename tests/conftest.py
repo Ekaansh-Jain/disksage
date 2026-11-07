@@ -10,6 +10,21 @@ import os
 import shutil
 import tempfile
 
+import pytest
+
 _fake_home = tempfile.mkdtemp(prefix="disksage-test-home-")
 os.environ["HOME"] = _fake_home
 atexit.register(shutil.rmtree, _fake_home, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_scan_and_no_docker(monkeypatch):
+    """Every test starts without a remembered scan (so `clean` scans what the
+    test just created), and without Docker: CI machines may run a real Docker,
+    which would add a Docker entry to every checklist."""
+    from disksage import models, tools
+
+    path = os.path.join(models.STATE_DIR, "last-scan.json")
+    if os.path.exists(path):
+        os.remove(path)
+    monkeypatch.setattr(tools, "docker_report", lambda timeout=5: None)

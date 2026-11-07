@@ -190,7 +190,7 @@ def build_file_items(files: list[FileInfo], big_min: int) -> list[Item]:
                 path=extra, size=on_disk.get(extra, 0), kind="duplicate", tier="duplicate",
                 label="Duplicate copy",
                 why=f"identical to {os.path.basename(keep)}; original kept in {keep_dir}",
-                source="hash"))
+                source="hash", original=keep))
         dup_paths.add(keep)  # never surface the kept original as a big file
 
     for f in files:

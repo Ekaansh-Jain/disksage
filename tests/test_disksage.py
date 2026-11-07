@@ -23,6 +23,7 @@ import pytest
 from disksage import cli, dedup, knowledge, llm, models, safety
 from disksage.classify import build_file_items
 from disksage.scan import collect_files, dir_size, is_dataless, scan_dirs, size_on_disk
+from disksage.tools import docker_report as real_docker_report  # conftest stubs the module's
 
 HOME = os.path.expanduser("~")
 
@@ -327,7 +328,7 @@ def test_only_built_in_safe_caches_are_deleted_directly():
 def test_docker_and_tool_tips_need_the_tool(monkeypatch):
     from disksage import tools
     monkeypatch.setattr(tools.shutil, "which", lambda _: None)
-    assert tools.docker_usage() is None
+    assert real_docker_report() is None
     assert tools.available() == []
     for cleanup in tools.NATIVE_CLEANUPS:
         assert cleanup.command[0] == cleanup.tool and cleanup.removes
@@ -353,11 +354,9 @@ def _clutter():
 
 
 def test_clean_deletes_caches_and_trashes_the_rest(monkeypatch, capsys):
-    from disksage import tools
     pip_cache, node_modules = _clutter()
     trashed = []
     monkeypatch.setattr(cli, "trash", trashed.append)
-    monkeypatch.setattr(tools, "docker_usage", lambda: None)
     monkeypatch.setattr("builtins.input", _answer)
 
     assert cli.main(["clean", "--no-ai", "--no-files", "--min-size", "1"]) == 0
@@ -369,11 +368,9 @@ def test_clean_deletes_caches_and_trashes_the_rest(monkeypatch, capsys):
 
 
 def test_clean_dry_run_changes_nothing(monkeypatch, capsys):
-    from disksage import tools
     pip_cache, node_modules = _clutter()
     trashed = []
     monkeypatch.setattr(cli, "trash", trashed.append)
-    monkeypatch.setattr(tools, "docker_usage", lambda: None)
     monkeypatch.setattr("builtins.input", _answer)
 
     assert cli.main(["clean", "--dry-run", "--no-ai", "--no-files", "--min-size", "1"]) == 0
@@ -577,11 +574,9 @@ def test_project_last_touched_uses_the_newest_marker():
 
 
 def test_scan_shows_results_and_suggests_setup_instead_of_asking(monkeypatch, capsys):
-    from disksage import tools
     _make(os.path.join(HOME, "Library/Application Support/MysteryApp/blob.bin"),
           os.urandom(3 * MB))
     monkeypatch.setattr(cli.llm, "resolve", lambda: None)
-    monkeypatch.setattr(tools, "docker_usage", lambda: None)
     monkeypatch.setattr("builtins.input", lambda *a: pytest.fail("scan must not ask anything"))
     assert cli.main(["scan", "--no-files", "--min-size", "1"]) == 0
     out = " ".join(capsys.readouterr().out.split())   # rich wraps long lines
@@ -725,11 +720,325 @@ def test_dedupe_clones_and_every_app_keeps_its_file(model_stores, monkeypatch, c
 
 
 def test_scan_json_is_valid_and_quiet(monkeypatch, capsys):
-    from disksage import tools
     _make(os.path.join(HOME, "Library/Caches/pip/http/json-test.bin"), os.urandom(2 * MB))
     monkeypatch.setattr(cli.llm, "resolve", lambda: None)
-    monkeypatch.setattr(tools, "docker_usage", lambda: None)
     assert cli.main(["scan", "--json", "--no-files", "--min-size", "1"]) == 0
     data = json.loads(capsys.readouterr().out)        # nothing but JSON on stdout
     pip = [i for i in data["items"] if i["path"].endswith("Library/Caches/pip")][0]
     assert pip["tier"] == "safe" and pip["pre_ticked"] is True
+
+
+# ---- faster scanning: parallel, one walk of project folders, live counts ----
+
+@pytest.mark.parametrize("workers", [1, 4])
+def test_sizing_matches_each_folder_and_counts_progress(monkeypatch, workers):
+    from disksage import scan
+    from disksage.scan import ScanProgress
+    monkeypatch.setattr(scan, "SCAN_WORKERS", workers)
+    expected = {}
+    for n in range(10):
+        folder = os.path.join(HOME, "Library/Caches", f"parallel-{n}")
+        for k in range(3):
+            _make(os.path.join(folder, f"f{k}.bin"), os.urandom((n + 1) * 100_000))
+        expected[folder] = sum(size_on_disk(os.stat(os.path.join(folder, f"f{k}.bin")))
+                               for k in range(3))
+    progress = ScanProgress()
+    items = {i.path: i.size for i in scan_dirs(min_size=1, progress=progress)}
+    for folder, size in expected.items():
+        assert items[folder] == size
+    assert progress.files >= 30 and progress.bytes >= sum(expected.values())
+
+
+def test_one_walk_finds_cruft_and_big_files_but_skips_git_and_packages():
+    from disksage.scan import walk_projects
+    root = os.path.join(HOME, "walk-root")
+    _make(os.path.join(root, "proj", "node_modules", "dep.js"), os.urandom(2 * MB))
+    _make(os.path.join(root, "proj", ".git", "objects", "pack.bin"), os.urandom(2 * MB))
+    _make(os.path.join(root, "proj", "Tool.app", "Contents", "big.bin"), os.urandom(2 * MB))
+    _make(os.path.join(root, "proj", "data.bin"), os.urandom(2 * MB))
+    walk = walk_projects([root], file_min=MB)
+    assert walk.cruft == [os.path.join(root, "proj", "node_modules")]
+    assert [f.path for f in walk.files] == [os.path.join(root, "proj", "data.bin")]
+
+
+def test_a_cancelled_scan_stops_walking():
+    from disksage.scan import ScanProgress
+    folder = os.path.join(HOME, "Library/Caches/cancel-me")
+    _make(os.path.join(folder, "a.bin"), os.urandom(MB))
+    progress = ScanProgress()
+    progress.cancel()
+    assert dir_size(folder, progress=progress) == 0
+
+
+# ---- the summary: grouped by what it costs you, no double counting ----
+
+def test_summary_groups_split_model_bytes_without_counting_twice(monkeypatch):
+    import time
+
+    from disksage.scan import Item
+    for var in ("HF_HOME", "HF_HUB_CACHE", "OLLAMA_MODELS"):
+        monkeypatch.delenv(var, raising=False)
+    items = [
+        Item(path=os.path.join(HOME, "Library/Caches/pip"), size=100, tier="safe",
+             source="knowledge"),
+        Item(path=os.path.join(HOME, "Projects/a/node_modules"), size=200, tier="review",
+             source="knowledge", touched=time.time() - 90 * 86400),
+        Item(path=os.path.join(HOME, ".ollama/models"), size=900, tier="review",
+             source="knowledge"),
+        Item(path=os.path.join(HOME, "Documents/big.parquet"), size=50, kind="file",
+             tier="review", label="Large dataset", source="extension"),
+        Item(path=os.path.join(HOME, "Library/Application Support/MobileSync"), size=1000,
+             tier="keep", source="knowledge"),
+    ]
+    result = cli.ScanResult(items=items,
+                            dupes=models.DuplicateEstimate(groups=1, reclaimable=600, exact=True),
+                            docker=cli.tools.DockerReport(rows=(), reclaimable=300))
+    buckets, kept = cli._buckets(result)
+    sizes = {b.key: b.size for b in buckets}
+    assert sizes == {"now": 100, "dedupe": 600, "stale": 200, "models": 300,
+                     "docker": 300, "judge": 50}
+    assert [i.tier for i in kept] == ["keep"]
+    assert "Large dataset" in [b for b in buckets if b.key == "judge"][0].what
+
+
+def test_scan_prints_the_summary_first(capsys):
+    _make(os.path.join(HOME, "Library/Caches/pip/http/summary.bin"), os.urandom(2 * MB))
+    assert cli.main(["scan", "--no-ai", "--no-files", "--min-size", "1"]) == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "Scanned" in out and "Free up to" in out and "nothing lost" in out
+    assert out.index("Free up to") < out.index("Biggest items")
+    assert HOME not in out          # paths are shown as ~/…
+
+
+def test_estimate_matches_by_name_for_free_and_by_size_otherwise(tmp_path):
+    data = os.urandom(MB)
+    paths = [_make(str(tmp_path / n), data) for n in ("hf.bin", "ollama.bin", "lms.gguf")]
+    hf = models.ModelFile("huggingface", paths[0], MB, "ab" * 32, on_disk=MB)
+    ol = models.ModelFile("ollama", paths[1], MB, "ab" * 32, on_disk=MB)
+    lms = models.ModelFile("lmstudio", paths[2], MB, None, on_disk=MB)
+    exact = models.estimate_duplicates([hf, ol], records={})
+    assert (exact.groups, exact.reclaimable, exact.exact) == (1, MB, True)
+    loose = models.estimate_duplicates([hf, ol, lms], records={})
+    assert (loose.groups, loose.reclaimable, loose.exact) == (1, 2 * MB, False)
+    assert lms.sha256 is None       # nothing was read
+
+
+def test_docker_report_adds_up_dockers_own_numbers(monkeypatch):
+    from types import SimpleNamespace
+
+    from disksage import tools
+    rows = [{"Type": "Images", "Size": "4.2GB", "Reclaimable": "3.1GB (73%)"},
+            {"Type": "Containers", "Size": "120MB", "Reclaimable": "0B (0%)"},
+            {"Type": "Build Cache", "Size": "800.5MB", "Reclaimable": "800.5MB"}]
+    out = "\n".join(json.dumps(r) for r in rows)
+    monkeypatch.setattr(tools.shutil, "which", lambda _: "/usr/local/bin/docker")
+    monkeypatch.setattr(tools.subprocess, "run",
+                        lambda *a, **k: SimpleNamespace(returncode=0, stdout=out, stderr=""))
+    report = real_docker_report()
+    assert report.reclaimable == 3_100_000_000 + 800_500_000
+    assert report.rows[0] == ("Images", "4.2GB", "3.1GB (73%)")
+    assert tools.parse_docker_size("45kB") == 45_000 and tools.parse_docker_size("?") == 0
+
+
+# ---- one flow, and `clean` reuses a recent scan ----
+
+def _counting_scans(monkeypatch):
+    calls = []
+    original = cli.scan_dirs
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(cli, "scan_dirs", counting)
+    return calls
+
+
+SCAN_ARGS = ["--no-ai", "--no-files", "--min-size", "1"]
+
+
+def test_clean_reuses_a_recent_scan_and_rescans_when_asked(monkeypatch, capsys):
+    _clutter()
+    calls = _counting_scans(monkeypatch)
+    monkeypatch.setattr("builtins.input", lambda *a: "n")
+    assert cli.main(["scan", *SCAN_ARGS]) == 0
+    assert cli.main(["clean", "--dry-run", *SCAN_ARGS]) == 0
+    assert len(calls) == 1
+    assert "Using the scan from" in capsys.readouterr().out
+    assert cli.main(["clean", "--dry-run", "--rescan", *SCAN_ARGS]) == 0
+    assert len(calls) == 2
+    assert cli.main(["clean", "--dry-run", "--no-ai", "--no-files", "--min-size", "2"]) == 0
+    assert len(calls) == 3          # different options: never reuse
+
+
+def test_an_old_scan_is_not_reused(monkeypatch):
+    _clutter()
+    calls = _counting_scans(monkeypatch)
+    monkeypatch.setattr("builtins.input", lambda *a: "n")
+    assert cli.main(["scan", *SCAN_ARGS]) == 0
+    path = cli._scan_cache_path()
+    with open(path) as f:
+        data = json.load(f)
+    data["created"] -= cli.SCAN_REUSE_SECONDS + 60
+    with open(path, "w") as f:
+        json.dump(data, f)
+    assert cli.main(["clean", "--dry-run", *SCAN_ARGS]) == 0
+    assert len(calls) == 2
+
+
+def test_a_saved_scan_is_private_and_cleared_after_cleaning(monkeypatch):
+    _clutter()
+    monkeypatch.setattr(cli, "trash", lambda path: None)
+    monkeypatch.setattr("builtins.input", _answer)
+    assert cli.main(["scan", *SCAN_ARGS]) == 0
+    assert os.stat(cli._scan_cache_path()).st_mode & 0o777 == 0o600
+    assert cli.main(["clean", *SCAN_ARGS]) == 0
+    assert not os.path.exists(cli._scan_cache_path())   # the disk changed: scan again next time
+
+
+def test_an_edited_scan_file_cannot_make_anything_safe():
+    import argparse
+
+    from disksage.scan import Item
+    thesis = os.path.join(HOME, "Documents", "thesis")
+    _make(os.path.join(thesis, "chapter1.docx"), b"years of work")
+    args = argparse.Namespace(min_size=1, big_size=200, dup_size=50, no_files=True,
+                              no_ai=True, root=None)
+    cli._save_scan(cli.ScanResult(items=[Item(path=thesis, size=1)],
+                                  options=cli._scan_options(args)))
+    with open(cli._scan_cache_path()) as f:
+        data = json.load(f)
+    data["items"][0].update(tier="safe", source="knowledge", label="pip cache")
+    data["items"].append(dict(data["items"][0], path=os.path.join(HOME, "Documents", "..",
+                                                                   "Documents", "thesis")))
+    with open(cli._scan_cache_path(), "w") as f:
+        json.dump(data, f)
+    loaded = cli._load_scan(args)
+    assert [i.path for i in loaded.items] == [thesis]   # the ".." path was dropped
+    assert loaded.items[0].tier == "review"             # tier came from the rules, not the file
+    assert not cli._deletes_directly(loaded.items[0])
+    assert not cli._default_checked(loaded.items[0])
+
+
+def test_bare_disksage_in_a_terminal_scans_once_then_cleans(monkeypatch, capsys):
+    # Bare `disksage` takes no options, so the cache has to clear the default 20 MB bar.
+    pip_cache = os.path.join(HOME, "Library/Caches/pip")
+    _make(os.path.join(pip_cache, "http", "big-wheel.bin"), os.urandom(25 * MB))
+    calls = _counting_scans(monkeypatch)
+    monkeypatch.setattr(cli.llm, "resolve", lambda: None)
+    monkeypatch.setattr(cli, "_is_interactive", lambda: True)
+    monkeypatch.setattr(cli, "_tui_available", lambda: False)
+    monkeypatch.setattr(cli, "trash", lambda path: None)
+
+    def answers(prompt=""):
+        if "Review and clean now" in prompt:
+            return ""                    # Enter means yes
+        if "known caches" in prompt:
+            return "y"
+        if "Type 'yes'" in prompt:
+            return "yes"
+        return "n"
+    monkeypatch.setattr("builtins.input", answers)
+    assert cli.main([]) == 0
+    assert len(calls) == 1
+    assert not os.path.exists(pip_cache)
+    out = capsys.readouterr().out
+    assert out.index("Free up to") < out.index("About to clean")
+
+
+def test_bare_disksage_when_piped_only_reports(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_is_interactive", lambda: False)
+    monkeypatch.setattr("builtins.input", lambda *a: pytest.fail("must not ask when piped"))
+    assert cli.main([]) == 0
+    assert "Nothing was changed" in capsys.readouterr().out
+
+
+def test_docker_cleanup_is_a_checklist_item(monkeypatch, capsys):
+    import argparse
+
+    from disksage import tools
+    ran = []
+    monkeypatch.setattr(tools, "run", lambda cleanup: ran.append(cleanup) or (True, "3.1GB"))
+    monkeypatch.setattr("builtins.input",
+                        lambda p="": "yes" if "Type 'yes'" in p else "y" if "Run this" in p else "n")
+    result = cli.ScanResult(items=[], docker=tools.DockerReport(
+        rows=(("Images", "4.2GB", "3.1GB (73%)"),), reclaimable=3_100_000_000))
+    assert cli._clean(result, argparse.Namespace(dry_run=False), None) == 0
+    assert ran == [tools.DOCKER_PRUNE]
+    assert "ran: docker system prune --force" in capsys.readouterr().out
+
+
+def test_ctrl_c_while_cleaning_stops_and_says_what_happened(monkeypatch, capsys):
+    _clutter()
+    trashed = []
+
+    def interrupt(path):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(cli, "remove_regenerable", interrupt)
+    monkeypatch.setattr(cli, "trash", trashed.append)
+    monkeypatch.setattr("builtins.input", _answer)
+    assert cli.main(["clean", *SCAN_ARGS]) == 130
+    # The first deletion is interrupted: nothing done, nothing after it touched.
+    assert "Stopped after 0 of" in capsys.readouterr().out
+    assert trashed == []
+
+
+def test_short_paths_work_when_home_is_a_symlink(monkeypatch):
+    monkeypatch.setattr(cli, "HOME", "/Users/me")
+    monkeypatch.setattr(cli, "_REAL_HOME", "/private/Users/me")
+    assert cli._short_path("/private/Users/me/Projects/x") == "~/Projects/x"
+    assert cli._short_path("/Users/me") == "~"
+    assert cli._short_path("/Users/meow/x") == "/Users/meow/x"
+
+
+def test_models_shows_names_not_hashes(model_stores, capsys):
+    import re
+    assert cli.main(["models", "--min-size", "1"]) == 0
+    out = capsys.readouterr().out
+    assert "Llama-3.2-3B-Instruct-Q4_K_M.gguf" in out and "llama3.2:latest" in out
+    assert not re.search(r"[0-9a-f]{64}", out)
+    assert cli.main(["models", "--paths", "--min-size", "1"]) == 0
+    assert re.search(r"[0-9a-f]{64}", capsys.readouterr().out)
+
+
+def test_checklist_sections_follow_the_summary(monkeypatch):
+    """The checklist uses the same groups, in the same order, as the summary,
+    and only things that cost nothing to rebuild start ticked."""
+    import time
+    import types
+
+    from disksage.scan import Item
+    captured = {}
+
+    def fake_checkbox(message, choices, **kwargs):
+        captured["choices"] = choices
+        return types.SimpleNamespace(ask=lambda: [c.value for c in choices
+                                                  if getattr(c, "checked", False)])
+    import questionary
+    monkeypatch.setattr(questionary, "checkbox", fake_checkbox)
+    cache = Item(path=os.path.join(HOME, "Library/Caches/pip"), size=10, tier="safe",
+                 source="knowledge", label="pip download cache")
+    stale = Item(path=os.path.join(HOME, "Projects/old/node_modules"), size=20, tier="review",
+                 source="knowledge", label="Node modules", touched=time.time() - 90 * 86400)
+    active = Item(path=os.path.join(HOME, "Projects/new/node_modules"), size=30, tier="review",
+                  source="knowledge", label="Node modules", touched=time.time())
+    docker = Item(path=cli.DOCKER_ITEM, size=40, kind="command", tier="review",
+                  label="Docker cleanup", source="docker")
+    picked = cli._select_tui([active, docker, stale, cache])
+    headings = [c.title for c in captured["choices"] if type(c).__name__ == "Separator"
+                and c.title.strip()]
+    assert [h.split(" · ")[0].strip("─ ") for h in headings] == [
+        "NOTHING LOST", "REBUILD IF NEEDED", "DOCKER'S OWN CLEANUP", "YOURS TO JUDGE"]
+    assert picked == [cache, stale]
+
+
+def test_long_paths_keep_whole_folder_names_and_the_project():
+    # The project name matters more than where the path starts.
+    assert cli._fit("~/Projects/old-react-app/node_modules", 34) == "…/old-react-app/node_modules"
+    assert cli._fit("~/.ollama/models", 30) == "~/.ollama/models"
+    assert cli._fit("~/Library/Caches/com.example.app/data", 32) == "…/Caches/com.example.app/data"
+    # When keeping the start costs no folder names, it's kept.
+    assert cli._fit("~/Library/VeryLongFolderNameHereX/target", 30) == "~/Library/…/target"
+    for path, budget in (("~/Library/Application Support/Google/Chrome/Default/Service Worker",
+                          40), ("~/x/an-extremely-long-single-folder-name-here", 20)):
+        shortened = cli._fit(path, budget)
+        assert len(shortened) <= budget and shortened.startswith(("~", "…"))

@@ -279,9 +279,18 @@ def _scan_and_classify(args, con):
     file_items = []
     if not args.no_files:
         roots = [args.root] if args.root else None
+        stats: dict = {}
         with _status(con, "Checking big files & duplicates…"):
-            files = collect_files(file_min=args.dup_size * mb, roots=roots)
+            files = collect_files(file_min=args.dup_size * mb, roots=roots, stats=stats)
             file_items = build_file_items(files, big_min=args.big_size * mb)
+        if stats.get("cloud_only_files"):
+            # Placeholders free nothing locally, and reading them would download them.
+            _say(con,
+                 f"[dim]Skipped {stats['cloud_only_files']} file(s) "
+                 f"({human(stats['cloud_only_bytes'])}) that are only in iCloud or another "
+                 f"cloud drive; deleting them wouldn't free space on this Mac.[/dim]",
+                 f"Skipped {stats['cloud_only_files']} cloud-only file(s) "
+                 f"({human(stats['cloud_only_bytes'])}).")
 
     return dir_items + file_items
 
@@ -337,10 +346,11 @@ def _tui_available() -> bool:
 
 
 def _default_checked(it) -> bool:
-    # Pre-tick only the low-risk items: knowledge-base safe caches and duplicate
-    # extra copies (an original is always kept). Review and AI-tagged items
-    # start unchecked so the user opts in.
-    return (it.tier == "duplicate") or (it.tier == "safe" and it.source != "ai")
+    # Pre-tick only the low-risk items: knowledge-base safe caches. Duplicates
+    # start unchecked: two identical files in different projects may each be
+    # used by code, so the user decides. Review and AI-tagged items start
+    # unchecked so the user opts in.
+    return it.tier == "safe" and it.source != "ai"
 
 
 def _short_path(path: str) -> str:
@@ -349,7 +359,7 @@ def _short_path(path: str) -> str:
 
 _TIER_HEADINGS = {
     "safe": "SAFE — regenerates automatically",
-    "duplicate": "DUPLICATES — one original is always kept",
+    "duplicate": "DUPLICATES — one original is always kept; tick the copies you don't need",
     "review": "REVIEW — reclaimable, but check first",
 }
 

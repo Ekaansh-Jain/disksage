@@ -13,8 +13,9 @@ Run:  ./.venv/bin/python -m pytest -q
 import os
 import tempfile
 
-from disksage import dedup, knowledge, llm, safety
-from disksage.scan import dir_size
+from disksage import cli, dedup, knowledge, llm, safety
+from disksage.classify import build_file_items
+from disksage.scan import collect_files, dir_size, is_dataless, scan_dirs, size_on_disk
 
 HOME = os.path.expanduser("~")
 
@@ -117,7 +118,74 @@ def test_dir_size_excludes_stopped_children(tmp_path):
     _write(tmp_path / "top.bin", b"A" * 1000)
     _write(child / "inner.bin", b"B" * 5000)
 
+    top = size_on_disk(os.stat(tmp_path / "top.bin"))
+    inner = size_on_disk(os.stat(child / "inner.bin"))
     full = dir_size(str(tmp_path))
     own = dir_size(str(tmp_path), stop={str(child)})
-    assert full == 6000
-    assert own == 1000
+    assert full == top + inner
+    assert own == top
+
+
+# ---- sizes are bytes on disk, each file counted once ----
+
+MB = 1024 * 1024
+
+
+def test_sparse_file_counts_bytes_on_disk(tmp_path):
+    sparse = tmp_path / "vm.img"
+    with open(sparse, "wb") as f:
+        f.truncate(512 * MB)          # 512 MB long, almost nothing on disk
+    assert os.stat(sparse).st_size == 512 * MB
+    assert dir_size(str(tmp_path)) < MB
+
+
+def test_hard_link_counted_once_across_a_scan(tmp_path):
+    (tmp_path / "one").mkdir()
+    (tmp_path / "two").mkdir()
+    _write(tmp_path / "one" / "model.bin", os.urandom(2 * MB))
+    os.link(tmp_path / "one" / "model.bin", tmp_path / "two" / "model.bin")
+    seen: set = set()
+    assert dir_size(str(tmp_path / "one"), seen=seen) >= 2 * MB
+    assert dir_size(str(tmp_path / "two"), seen=seen) == 0
+
+
+def test_hard_link_is_never_its_own_duplicate(tmp_path):
+    _write(tmp_path / "weights.safetensors", os.urandom(2 * MB))
+    os.link(tmp_path / "weights.safetensors", tmp_path / "weights-link.safetensors")
+    os.symlink(tmp_path / "weights.safetensors", tmp_path / "weights-symlink.safetensors")
+    files = collect_files(MB, roots=[str(tmp_path)])
+    assert len(files) == 1                     # one real file, whatever its names
+    items = build_file_items(files, big_min=100 * MB)
+    assert not [i for i in items if i.tier == "duplicate"]
+
+
+def test_real_duplicates_are_found_but_not_pre_ticked(tmp_path):
+    data = os.urandom(2 * MB)
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    _write(tmp_path / "a" / "data.parquet", data)
+    _write(tmp_path / "b" / "data.parquet", data)
+    items = build_file_items(collect_files(MB, roots=[str(tmp_path)]), big_min=100 * MB)
+    dups = [i for i in items if i.tier == "duplicate"]
+    assert len(dups) == 1
+    assert dups[0].size >= 2 * MB
+    assert cli._default_checked(dups[0]) is False
+
+
+def test_cloud_placeholders_are_recognized():
+    class FakeStat:
+        st_flags = 0x40000000
+    assert is_dataless(FakeStat())
+    FakeStat.st_flags = 0
+    assert not is_dataless(FakeStat())
+
+
+def test_scan_dirs_reports_bytes_on_disk(tmp_path):
+    proj = tmp_path / "proj" / "node_modules"
+    proj.mkdir(parents=True)
+    with open(proj / "sparse.bin", "wb") as f:
+        f.truncate(300 * MB)
+    _write(proj / "real.bin", os.urandom(3 * MB))
+    items = scan_dirs(min_size=MB, root=str(tmp_path))
+    assert [os.path.basename(i.path) for i in items] == ["node_modules"]
+    assert 3 * MB <= items[0].size < 10 * MB

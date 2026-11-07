@@ -12,9 +12,14 @@ Only items at or above `min_size` are returned, so the report stays readable.
 from __future__ import annotations
 
 import os
+import stat
 from dataclasses import dataclass
 
 HOME = os.path.expanduser("~")
+
+# macOS <sys/stat.h>: the file's contents live in iCloud / a File Provider, not on
+# this disk. Python 3.13+ exposes it as stat.SF_DATALESS.
+SF_DATALESS = getattr(stat, "SF_DATALESS", 0x40000000)
 
 # Each immediate child of these is a candidate.
 CONTAINER_DIRS = [
@@ -85,20 +90,54 @@ class Item:
     source: str = ""
 
 
-def dir_size(path: str, stop: set[str] | None = None) -> int:
-    """Total bytes under path, not following symlinks.
+def size_on_disk(st: os.stat_result) -> int:
+    """Bytes a file really occupies.
+
+    st_size is the file's *length*. Sparse files (VM images), cloud placeholders
+    and compressed files take far less space on disk, so totals built from
+    st_size promise space that deleting will never free."""
+    blocks = getattr(st, "st_blocks", None)
+    return blocks * 512 if blocks is not None else st.st_size
+
+
+def is_dataless(st: os.stat_result) -> bool:
+    """True for iCloud / Dropbox / OneDrive placeholders whose contents aren't on
+    this Mac. Deleting one frees nothing locally, and reading one (to hash it)
+    makes macOS download it."""
+    return bool(getattr(st, "st_flags", 0) & SF_DATALESS)
+
+
+def _count_once(st: os.stat_result, seen: set[tuple[int, int]]) -> int:
+    """Bytes on disk for one file, counting a hard-linked file only the first
+    time we meet it (the same bytes can have several names)."""
+    if st.st_nlink > 1:
+        key = (st.st_dev, st.st_ino)
+        if key in seen:
+            return 0
+        seen.add(key)
+    return size_on_disk(st)
+
+
+def dir_size(path: str, stop: set[str] | None = None,
+             seen: set[tuple[int, int]] | None = None) -> int:
+    """Bytes on disk under path, not following symlinks.
 
     `stop` is a set of paths NOT to descend into — used so a parent folder
     doesn't double-count bytes that belong to a separately-listed child
-    (e.g. Application Support/Claude excludes its own vm_bundles)."""
+    (e.g. Application Support/Claude excludes its own vm_bundles).
+
+    `seen` is shared across one whole scan so a hard-linked file is only
+    counted for the first candidate that contains it."""
     stop = stop or set()
+    seen = set() if seen is None else seen
     try:
-        if os.path.islink(path):
-            return 0
-        if os.path.isfile(path):
-            return os.path.getsize(path)
+        st = os.lstat(path)
     except OSError:
         return 0
+    if stat.S_ISLNK(st.st_mode):
+        return 0
+    if not stat.S_ISDIR(st.st_mode):
+        return _count_once(st, seen)
     total = 0
     stack = [path]
     while stack:
@@ -114,7 +153,7 @@ def dir_size(path: str, stop: set[str] | None = None) -> int:
                                 continue  # belongs to a deeper candidate
                             stack.append(entry.path)
                         else:
-                            total += entry.stat(follow_symlinks=False).st_size
+                            total += _count_once(entry.stat(follow_symlinks=False), seen)
                     except OSError:
                         continue
         except OSError:
@@ -194,24 +233,44 @@ def scan_dirs(min_size: int = 20 * 1024 * 1024, root: str | None = None) -> list
 
     Sizes are NON-OVERLAPPING: when one candidate lives inside another, the
     parent's size excludes the child, so the same bytes are never counted
-    twice and every folder shows its own reclaimable weight."""
+    twice and every folder shows its own reclaimable weight. Sizes are bytes
+    on disk, and a hard-linked file counts once across the whole scan."""
     candidates = collect_candidates(root)
     cand_set = set(candidates)
+    seen: set[tuple[int, int]] = set()
 
     items: list[Item] = []
     for path in candidates:
         others = cand_set - {path}
-        size = dir_size(path, stop=others)
+        size = dir_size(path, stop=others, seen=seen)
         if size >= min_size:
             items.append(Item(path=path, size=size, kind="dir"))
     items.sort(key=lambda i: i.size, reverse=True)
     return items
 
 
-def collect_files(file_min: int, roots: list[str] | None = None) -> list[tuple[str, int]]:
-    """All files >= file_min bytes inside the given roots (default: project
-    roots), skipping cruft/.git dirs (already accounted for as directories)."""
-    out: list[tuple[str, int]] = []
+@dataclass(frozen=True)
+class FileInfo:
+    path: str
+    size: int      # length in bytes: identical files have equal lengths, so group duplicates by this
+    on_disk: int   # bytes allocated: what deleting the file frees; show and total this
+
+
+def collect_files(file_min: int, roots: list[str] | None = None,
+                  stats: dict | None = None) -> list[FileInfo]:
+    """All regular files >= file_min bytes inside the given roots (default:
+    project roots), skipping cruft/.git dirs (already accounted for as
+    directories).
+
+    Never returns the same bytes twice: symlinks are skipped, and only the first
+    name of a hard-linked file is kept, so a file can't be offered as a
+    "duplicate" of itself. Cloud placeholders are skipped (they free nothing and
+    reading them downloads them); pass a `stats` dict to get how many."""
+    out: list[FileInfo] = []
+    seen: set[tuple[int, int]] = set()
+    if stats is not None:
+        stats.setdefault("cloud_only_files", 0)
+        stats.setdefault("cloud_only_bytes", 0)
     for root in (roots if roots is not None else PROJECT_ROOTS):
         if not os.path.isdir(root):
             continue
@@ -224,13 +283,21 @@ def collect_files(file_min: int, roots: list[str] | None = None) -> list[tuple[s
             for name in filenames:
                 fp = os.path.join(dirpath, name)
                 try:
-                    if os.path.islink(fp):
-                        continue
-                    size = os.path.getsize(fp)
+                    st = os.lstat(fp)
                 except OSError:
                     continue
-                if size >= file_min:
-                    out.append((fp, size))
+                if not stat.S_ISREG(st.st_mode) or st.st_size < file_min:
+                    continue  # symlinks, sockets, small files
+                if is_dataless(st):
+                    if stats is not None:
+                        stats["cloud_only_files"] += 1
+                        stats["cloud_only_bytes"] += st.st_size
+                    continue
+                key = (st.st_dev, st.st_ino)
+                if key in seen:
+                    continue  # another name for a file we already have
+                seen.add(key)
+                out.append(FileInfo(fp, st.st_size, size_on_disk(st)))
     return out
 
 

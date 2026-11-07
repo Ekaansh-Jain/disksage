@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass
 
 from . import dedup, knowledge, llm
-from .scan import Item
+from .scan import FileInfo, Item
 
 VALID_TIERS = {"safe", "review", "keep"}
 
@@ -113,35 +113,35 @@ def classify(items: list[Item], use_ai: bool = True) -> list[Item]:
     return items
 
 
-def build_file_items(files: list[tuple[str, int]], big_min: int) -> list[Item]:
+def build_file_items(files: list[FileInfo], big_min: int) -> list[Item]:
     """Turn the raw file list into duplicate items + big loose-file items.
 
     Duplicates take precedence: an original copy is never listed (so it can't be
-    deleted through the tool), only the extra copies, tagged 'duplicate'."""
-    items: list[Item] = []
+    deleted through the tool), only the extra copies, tagged 'duplicate'.
 
-    groups = dedup.find_duplicates(files)
+    Duplicates are grouped by length (`size`), but every size shown or totalled
+    is bytes on disk (`on_disk`): that's what deleting a copy actually frees."""
+    items: list[Item] = []
+    on_disk = {f.path: f.on_disk for f in files}
+
+    groups = dedup.find_duplicates([(f.path, f.size) for f in files])
     dup_paths: set[str] = set()
     for group in groups:
         keep = group[0]
         keep_dir = os.path.dirname(keep)
-        try:
-            gsize = os.path.getsize(keep)
-        except OSError:
-            gsize = 0
         for extra in group[1:]:
             dup_paths.add(extra)
             items.append(Item(
-                path=extra, size=gsize, kind="duplicate", tier="duplicate",
+                path=extra, size=on_disk.get(extra, 0), kind="duplicate", tier="duplicate",
                 label="Duplicate copy",
                 why=f"identical to {os.path.basename(keep)}; original kept in {keep_dir}",
                 source="hash"))
         dup_paths.add(keep)  # never surface the kept original as a big file
 
-    for path, size in files:
-        if size >= big_min and path not in dup_paths:
-            hit = knowledge.file_kind(path)
-            items.append(Item(path=path, size=size, kind="file",
+    for f in files:
+        if f.on_disk >= big_min and f.path not in dup_paths:
+            hit = knowledge.file_kind(f.path)
+            items.append(Item(path=f.path, size=f.on_disk, kind="file",
                               tier=hit.tier, label=hit.label, why=hit.why,
                               source=hit.source))
     return items

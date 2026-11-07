@@ -550,6 +550,22 @@ def test_ml_leftovers_are_review_and_never_pre_ticked():
     assert cli._default_checked(item) is False
 
 
+def test_the_same_project_folder_under_two_names_is_listed_once():
+    """~/Projects and ~/projects are one folder on a case-insensitive Mac disk
+    (and a symlink can alias a root anywhere). It must be scanned once."""
+    from disksage.scan import collect_candidates
+    projects = os.path.join(HOME, "Projects")
+    _make(os.path.join(projects, "twice", "node_modules", "x.bin"), os.urandom(2 * MB))
+    _make(os.path.join(projects, "twice", "data.parquet"), os.urandom(2 * MB))
+    alias = os.path.join(HOME, "projects")
+    if not os.path.exists(alias):          # case-sensitive disk: make the alias ourselves
+        os.symlink(projects, alias)
+    found = [p for p in collect_candidates() if p.lower().endswith("twice/node_modules")]
+    assert len(found) == 1
+    files = collect_files(MB)
+    assert len([f for f in files if f.path.lower().endswith("twice/data.parquet")]) == 1
+
+
 def test_project_last_touched_uses_the_newest_marker():
     from disksage.scan import project_last_touched
     proj = os.path.join(HOME, "Projects", "markers")

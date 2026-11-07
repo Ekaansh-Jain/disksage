@@ -199,6 +199,30 @@ def dir_size(path: str, stop: set[str] | None = None,
     return total
 
 
+def _once_each(paths, follow_symlinks: bool) -> list[str]:
+    """`paths` without the ones that are another name for an earlier one.
+
+    On a case-insensitive disk (the macOS default) ~/Projects and ~/projects
+    are the same folder, and a symlink can alias another root. Walking both
+    listed every project folder twice and counted its size twice.
+
+    Roots are compared following symlinks (an alias of a root *is* that root);
+    candidates are compared without following them, so a symlink is never
+    mistaken for the folder it points to."""
+    seen: set[tuple[int, int]] = set()
+    out = []
+    for p in paths:
+        try:
+            st = os.stat(p) if follow_symlinks else os.lstat(p)
+        except OSError:
+            continue
+        key = (st.st_dev, st.st_ino)
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
+
+
 def project_last_touched(cruft_dir: str) -> float:
     """When the project around a cruft folder (its parent) was last worked on,
     as a Unix timestamp; 0.0 if unknown."""
@@ -257,7 +281,7 @@ def collect_candidates(root: str | None = None) -> list[str]:
     if root:
         cruft: list[str] = []
         _walk_for_cruft(root, cruft)
-        return sorted(set(cruft))
+        return _once_each(sorted(set(cruft)), follow_symlinks=False)
 
     paths: set[str] = set()
 
@@ -279,7 +303,7 @@ def collect_candidates(root: str | None = None) -> list[str]:
                 pass
 
     cruft: list[str] = []
-    for root in PROJECT_ROOTS:
+    for root in _once_each(PROJECT_ROOTS, follow_symlinks=True):
         if os.path.isdir(root):
             _walk_for_cruft(root, cruft)
     paths.update(cruft)
@@ -294,7 +318,7 @@ def collect_candidates(root: str | None = None) -> list[str]:
         if os.path.exists(s):
             paths.add(s)
 
-    return sorted(paths)
+    return _once_each(sorted(paths), follow_symlinks=False)
 
 
 def scan_dirs(min_size: int = 20 * 1024 * 1024, root: str | None = None) -> list[Item]:
@@ -340,7 +364,7 @@ def collect_files(file_min: int, roots: list[str] | None = None,
     if stats is not None:
         stats.setdefault("cloud_only_files", 0)
         stats.setdefault("cloud_only_bytes", 0)
-    for root in (roots if roots is not None else PROJECT_ROOTS):
+    for root in _once_each(roots if roots is not None else PROJECT_ROOTS, follow_symlinks=True):
         if not os.path.isdir(root):
             continue
         base_depth = root.rstrip(os.sep).count(os.sep)

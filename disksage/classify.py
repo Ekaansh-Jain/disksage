@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from dataclasses import dataclass
 
 from . import dedup, knowledge, llm
 from .scan import Item
@@ -56,9 +57,6 @@ def _extract_items(raw: str) -> list[dict]:
         except Exception:
             return []
     return []
-
-
-from dataclasses import dataclass
 
 
 @dataclass

@@ -18,15 +18,14 @@ import argparse
 import os
 import shutil
 import sys
-
 from contextlib import contextmanager
-
-HOME = os.path.expanduser("~")
 
 from . import __version__, config, llm
 from .classify import annotate_known, annotate_with_ai, build_file_items, human
 from .safety import git_risk, is_safe_to_trash, trash
 from .scan import collect_files, scan_dirs
+
+HOME = os.path.expanduser("~")
 
 TIER_STYLE = {
     "safe":      ("green",     "SAFE  "),

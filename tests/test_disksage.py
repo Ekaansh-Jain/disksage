@@ -64,10 +64,14 @@ def _write(path, data):
         f.write(data)
 
 def test_dedup_groups_only_identical(tmp_path):
-    a = tmp_path / "a.bin"; _write(a, b"X" * 100_000)
-    b = tmp_path / "b.bin"; _write(b, b"X" * 100_000)      # identical to a
-    c = tmp_path / "c.bin"; _write(c, b"Y" * 100_000)      # same size, differs
-    d = tmp_path / "d.bin"; _write(d, b"Z" * 50_000)       # unique size
+    a = tmp_path / "a.bin"
+    _write(a, b"X" * 100_000)
+    b = tmp_path / "b.bin"
+    _write(b, b"X" * 100_000)      # identical to a
+    c = tmp_path / "c.bin"
+    _write(c, b"Y" * 100_000)      # same size, differs
+    d = tmp_path / "d.bin"
+    _write(d, b"Z" * 50_000)       # unique size
 
     files = [(str(p), p.stat().st_size) for p in (a, b, c, d)]
     groups = dedup.find_duplicates(files)
@@ -78,8 +82,10 @@ def test_dedup_groups_only_identical(tmp_path):
     assert str(d) not in sum(groups, [])               # unique size excluded
 
 def test_dedup_keeps_an_original(tmp_path):
-    a = tmp_path / "a.bin"; _write(a, b"D" * 200_000)
-    b = tmp_path / "b.bin"; _write(b, b"D" * 200_000)
+    a = tmp_path / "a.bin"
+    _write(a, b"D" * 200_000)
+    b = tmp_path / "b.bin"
+    _write(b, b"D" * 200_000)
     groups = dedup.find_duplicates([(str(a), a.stat().st_size),
                                     (str(b), b.stat().st_size)])
     # group[0] is the kept original; only the rest are ever deletable.

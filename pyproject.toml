@@ -1,28 +1,56 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "disksage"
-version = "0.1.0"
-description = "Developer disk cleaner for macOS — finds dead venvs, duplicates, model files & more, not just caches"
+version = "0.2.0"
+description = "Developer disk cleaner for macOS that explains every folder it finds and never deletes your files without asking"
 readme = "README.md"
-requires-python = ">=3.9"
-license = { text = "MIT" }
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Ekaansh Jain" }]
+keywords = ["macos", "disk-cleanup", "disk-space", "developer-tools", "cli", "ollama", "lm-studio", "huggingface", "apfs"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: System :: Filesystems",
+    "Topic :: Utilities",
+]
 dependencies = [
     "openai>=1.30",
     "send2trash>=1.8",
     "rich>=13.0",
     "python-dotenv>=1.0",
     "questionary>=2.0",
+    "certifi>=2024.2.2",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[project.urls]
+Homepage = "https://github.com/Ekaansh-Jain/disksage"
+Issues = "https://github.com/Ekaansh-Jain/disksage/issues"
+Changelog = "https://github.com/Ekaansh-Jain/disksage/blob/main/CHANGELOG.md"
 
 [project.scripts]
 disksage = "disksage.cli:main"
 
 [tool.setuptools]
 packages = ["disksage"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "B", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

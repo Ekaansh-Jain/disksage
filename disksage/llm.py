@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.request
+from dataclasses import dataclass
 
 PROVIDERS = {
     "groq": {
@@ -120,9 +121,6 @@ def resolve() -> dict | None:
 def describe() -> str:
     cfg = resolve()
     return f"{cfg['name']} ({cfg['model']})" if cfg else "none (knowledge base only)"
-
-
-from dataclasses import dataclass
 
 
 @dataclass

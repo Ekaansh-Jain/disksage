@@ -1,0 +1,35 @@
+name: Bug report
+description: Something broke, or a size or label looks wrong
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If disksage offered to delete something that wasn't safe, please don't post it here.
+        Report it privately instead: see SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: disksage version
+      description: Output of `disksage --version`
+    validations:
+      required: true
+  - type: input
+    id: mac
+    attributes:
+      label: macOS version and Mac
+      placeholder: macOS 26.1, MacBook Air M2, 256 GB
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: Paste the relevant part of the output. Replace anything private in paths with `…`.
+      render: text

@@ -508,3 +508,64 @@ def test_chat_json_unreachable_server(monkeypatch):
     monkeypatch.setenv("DISKSAGE_LOCAL_MODEL", "m")
     res = llm.chat_json("system", "user", timeout=2)
     assert res.content is None and "reach" in res.error
+
+
+# ---- results first, and only stale project folders pre-ticked ----
+
+def _project(name, touched, folder="node_modules", marker="package.json"):
+    proj = os.path.join(HOME, "Projects", name)
+    _make(os.path.join(proj, marker), b"{}")
+    _make(os.path.join(proj, folder, "big.bin"), os.urandom(2 * MB))
+    os.utime(os.path.join(proj, marker), (touched, touched))
+    return os.path.join(proj, folder)
+
+
+def _classified(root):
+    from disksage.classify import annotate_known
+    items = scan_dirs(min_size=MB, root=root)
+    annotate_known(items)
+    cli._flag_project_folders(items)
+    return {i.path: i for i in items}
+
+
+def test_only_stale_projects_get_their_folders_pre_ticked():
+    import time
+    old = _project("old-app", time.time() - 120 * 86400)
+    new = _project("active-app", time.time())
+    items = _classified(os.path.join(HOME, "Projects"))
+    assert cli._default_checked(items[old]) is True
+    assert "project last touched 4 months ago" in items[old].why
+    assert cli._default_checked(items[new]) is False
+    assert cli._deletes_directly(items[old]) is False      # pre-ticked, but goes to the Trash
+
+
+def test_ml_leftovers_are_review_and_never_pre_ticked():
+    import time
+    runs = _project("experiments", time.time() - 400 * 86400,
+                    folder="lightning_logs", marker="pyproject.toml")
+    item = _classified(os.path.join(HOME, "Projects", "experiments"))[runs]
+    assert item.tier == "review" and item.label == "Lightning logs"
+    assert cli._default_checked(item) is False
+
+
+def test_project_last_touched_uses_the_newest_marker():
+    from disksage.scan import project_last_touched
+    proj = os.path.join(HOME, "Projects", "markers")
+    _make(os.path.join(proj, "package.json"), b"{}")
+    _make(os.path.join(proj, ".git", "HEAD"), b"ref: refs/heads/main\n")
+    os.utime(os.path.join(proj, "package.json"), (1_600_000_000, 1_600_000_000))
+    os.utime(os.path.join(proj, ".git", "HEAD"), (1_700_000_000, 1_700_000_000))
+    assert project_last_touched(os.path.join(proj, "node_modules")) == 1_700_000_000
+
+
+def test_scan_shows_results_and_suggests_setup_instead_of_asking(monkeypatch, capsys):
+    from disksage import tools
+    _make(os.path.join(HOME, "Library/Application Support/MysteryApp/blob.bin"),
+          os.urandom(3 * MB))
+    monkeypatch.setattr(cli.llm, "resolve", lambda: None)
+    monkeypatch.setattr(tools, "docker_usage", lambda: None)
+    monkeypatch.setattr("builtins.input", lambda *a: pytest.fail("scan must not ask anything"))
+    assert cli.main(["scan", "--no-files", "--min-size", "1"]) == 0
+    out = " ".join(capsys.readouterr().out.split())   # rich wraps long lines
+    assert "MysteryApp" in out
+    assert "disksage setup" in out

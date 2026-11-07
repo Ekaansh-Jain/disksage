@@ -2,14 +2,17 @@
 
     disksage            scan and report (default) — deletes nothing
     disksage scan       same as above
-    disksage clean      scan, then pick items from a checklist to move to Trash
-                       (falls back to per-item y/N when input isn't a terminal)
+    disksage clean      scan, then pick items from a checklist to remove: caches
+                       that rebuild themselves are deleted, everything else goes
+                       to the Trash (per-item y/N when input isn't a terminal)
 
 Flags:
     --min-size MB      ignore items smaller than this (default 20)
     --provider NAME    force local | groq | gemini
     --no-ai            knowledge base only, no LLM
-    --root PATH        (reserved) restrict scanning
+    --root PATH        scan only this folder, for project folders
+                       (node_modules, .venv, build…) and big files
+    --dry-run          (clean) show what would happen, change nothing
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ import argparse
 import os
 import shutil
 import sys
+import time
 from contextlib import contextmanager
 
 from . import __version__, config, llm, tools
@@ -30,7 +34,7 @@ from .safety import (
     tracked_file_count,
     trash,
 )
-from .scan import CRUFT_DIR_NAMES, collect_files, scan_dirs
+from .scan import CRUFT_DIR_NAMES, collect_files, project_last_touched, scan_dirs
 
 HOME = os.path.expanduser("~")
 
@@ -207,20 +211,6 @@ def cmd_setup(args=None, first_run: bool = False) -> int:
     return 0
 
 
-def _maybe_first_run_setup(args) -> None:
-    """On the very first interactive run, offer setup once, then continue into
-    the scan the user asked for (fastest path to value)."""
-    if config.is_configured() or getattr(args, "no_ai", False):
-        return
-    if not sys.stdin.isatty():
-        return
-    print("👋 Welcome to disksage — quick one-time setup.\n")
-    cmd_setup(first_run=True)
-    config.load()
-    print("\nSetup complete — running your first scan now.")
-    print("(next time: `disksage scan` to report, `disksage clean` to free space)\n")
-
-
 def _print_provider_banner(con) -> None:
     cfg = llm.resolve()
     if cfg:
@@ -228,21 +218,8 @@ def _print_provider_banner(con) -> None:
                f"are sent for labelling, never file contents.")
         con.print(f"[dim]{msg}[/dim]") if con else print(msg)
         return
-    head = "No AI configured — running with the knowledge base only."
-    tail = [
-        "Known caches and junk are still found; unrecognized folders just stay",
-        "labelled 'review' instead of being identified for you.",
-        "To enable smarter labels (optional): add GROQ_API_KEY or GEMINI_API_KEY",
-        "to a .env file, or run LM Studio locally. See the README.",
-    ]
-    if con:
-        con.print(f"[yellow]{head}[/yellow]")
-        for line in tail:
-            con.print(f"[dim]{line}[/dim]")
-    else:
-        print(head)
-        for line in tail:
-            print(line)
+    msg = "No AI configured — using the built-in list only."
+    con.print(f"[dim]{msg}[/dim]") if con else print(msg)
 
 
 def _say(con, rich_msg: str, plain_msg: str) -> None:
@@ -260,18 +237,50 @@ def _status(con, text: str):
         yield
 
 
+# Project folders that rebuild from the project's own files (npm install, a
+# fresh venv, the next build). Only these get pre-ticked, and only in projects
+# nobody has touched for STALE_DAYS; they still go to the Trash, not deleted.
+REBUILDABLE = {"node_modules", ".venv", "venv", "target", "build", "dist",
+               ".next", ".nuxt", ".gradle"}
+STALE_DAYS = 30
+
+
+def _ago(ts: float) -> str:
+    days = int((time.time() - ts) // 86400)
+    if days < 1:
+        return "today"
+    if days < 60:
+        return f"{days} day{'s' if days != 1 else ''} ago"
+    if days < 730:
+        return f"{days // 30} months ago"
+    return f"{days // 365} years ago"
+
+
+def _is_stale(it) -> bool:
+    touched = getattr(it, "touched", 0.0)
+    return bool(touched) and time.time() - touched > STALE_DAYS * 86400
+
+
 def _flag_project_folders(items) -> None:
-    """A project folder named like build output (build/, dist/, target/…) can
-    still hold source code that git tracks. Flag those so they're never
-    pre-ticked and the user sees why."""
+    """Annotate project folders (node_modules, build/, .venv, …):
+
+    - A folder named like build output can still hold source code that git
+      tracks. Flag those so they're never pre-ticked and the user sees why.
+    - Otherwise note when the project was last worked on, so only stale
+      projects get their rebuildable folders pre-ticked."""
     for it in items:
-        if it.kind != "dir" or os.path.basename(it.path) not in CRUFT_DIR_NAMES:
+        name = os.path.basename(it.path)
+        if it.kind != "dir" or name not in CRUFT_DIR_NAMES:
             continue
         it.tracked = tracked_file_count(it.path)
         if it.tracked:
             it.tier = "review"
             it.why = (f"⚠ {it.tracked} file(s) here are tracked by git: "
                       f"this is source, not build output")
+            continue
+        it.touched = project_last_touched(it.path)
+        if it.touched and name in REBUILDABLE:
+            it.why = f"{it.why}; project last touched {_ago(it.touched)}"
 
 
 def _scan_and_classify(args, con):
@@ -284,6 +293,15 @@ def _scan_and_classify(args, con):
     unknown = annotate_known(dir_items)
     _flag_project_folders(dir_items)
     provider = llm.resolve()
+    if not args.no_ai and unknown and not provider:
+        # Results first; the AI is an optional extra, offered once we know it helps.
+        size = human(sum(u.size for u in unknown))
+        _say(con,
+             f"[yellow]{len(unknown)} folder(s) ({size}) aren't in the built-in list and stay "
+             f"REVIEW.[/yellow] [dim]Run `disksage setup` to let an AI identify them "
+             f"(it only sees paths and sizes).[/dim]",
+             f"{len(unknown)} folder(s) ({size}) aren't in the built-in list. "
+             f"Run `disksage setup` to let an AI identify them.")
     if not args.no_ai and unknown and provider:
         with _status(con, f"Identifying {len(unknown)} unrecognized item(s) with {provider['name']}…"):
             outcome = annotate_with_ai(unknown)
@@ -394,7 +412,11 @@ def _default_checked(it) -> bool:
     # unchecked so the user opts in, and so does anything git tracks.
     if getattr(it, "tracked", 0):
         return False
-    return it.tier == "safe" and it.source != "ai"
+    if it.tier == "safe":
+        return it.source != "ai"
+    # Rebuildable project folders, in projects nobody has touched for a month.
+    return (it.tier == "review" and it.source == "knowledge" and it.kind == "dir"
+            and os.path.basename(it.path) in REBUILDABLE and _is_stale(it))
 
 
 def _short_path(path: str) -> str:
@@ -475,7 +497,7 @@ def _select_tui(actionable):
 def _select_prompts(actionable):
     """Fallback selection: bulk prompts + per-item y/N (used when no TTY)."""
     queue = []
-    safe_bulk = [i for i in actionable if _default_checked(i)]
+    safe_bulk = [i for i in actionable if _default_checked(i) and _deletes_directly(i)]
     dups = [i for i in actionable if i.tier == "duplicate"]
     rest = [i for i in actionable if i not in safe_bulk and i not in dups]
 
@@ -655,8 +677,10 @@ def main(argv=None) -> int:
         sp.add_argument("--no-files", action="store_true",
                         help="skip big-file and duplicate scanning")
         sp.add_argument("--provider", default=None, help="local|groq|gemini")
-        sp.add_argument("--no-ai", action="store_true")
-        sp.add_argument("--root", default=None)
+        sp.add_argument("--no-ai", action="store_true",
+                        help="use the built-in list only, never call an AI")
+        sp.add_argument("--root", default=None,
+                        help="scan only this folder (project folders and big files)")
         if name == "clean":
             sp.add_argument("--dry-run", action="store_true",
                             help="show what would be deleted or trashed, change nothing")
@@ -676,8 +700,8 @@ def main(argv=None) -> int:
     if not hasattr(args, "min_size"):
         args = p.parse_args(["scan"])
 
-    _maybe_first_run_setup(args)
-
+    # No setup questions before the first result: the built-in list works on its
+    # own, and the scan says when an AI could identify more.
     if args.cmd == "clean":
         return cmd_clean(args)
     return cmd_scan(args)

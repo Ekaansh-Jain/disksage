@@ -138,6 +138,16 @@ RULES: list[Rule] = [
          name_glob=".next"),
     Rule("review", "Rust/Java target dir", "regenerates on next build",
          name_glob="target"),
+
+    # ---- REVIEW: ML leftovers (can hold results you can't regenerate) ----
+    Rule("review", "Weights & Biases runs", "local run files; safe once runs are synced",
+         name_glob="wandb"),
+    Rule("review", "MLflow runs", "experiment history; keep it if you still need it",
+         name_glob="mlruns"),
+    Rule("review", "Lightning logs", "logs and checkpoints; may hold trained weights",
+         name_glob="lightning_logs"),
+    Rule("review", "Jupyter autosaves", "autosaved copies of your notebooks",
+         name_glob=".ipynb_checkpoints"),
     Rule("review", "Maven repository", "re-downloaded on next build",
          path_glob="*/.m2/repository"),
     Rule("review", "Arduino board cores", "re-add via Boards Manager",

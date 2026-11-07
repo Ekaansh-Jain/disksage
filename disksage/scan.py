@@ -41,7 +41,18 @@ CRUFT_DIR_NAMES = {
     "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache",
     ".mypy_cache", ".ruff_cache", ".turbo", "target", "dist", "build",
     ".next", ".nuxt", ".gradle",
+    # ML leftovers: often big, but they can hold results you can't regenerate,
+    # so they're always REVIEW and never pre-ticked (see knowledge.py).
+    "wandb", "mlruns", "lightning_logs", ".ipynb_checkpoints",
 }
+
+# Files that change when you work on a project. Their newest mtime is a good
+# stand-in for "when did I last work on this".
+PROJECT_MARKERS = (
+    "package.json", "pyproject.toml", "requirements.txt", "setup.py", "Cargo.toml",
+    "go.mod", "pom.xml", "build.gradle", "Gemfile", "composer.json",
+    ".git/index", ".git/HEAD",
+)
 
 # Known heavy singletons worth surfacing directly.
 SINGLETONS = [
@@ -186,6 +197,24 @@ def dir_size(path: str, stop: set[str] | None = None,
         except OSError:
             continue
     return total
+
+
+def project_last_touched(cruft_dir: str) -> float:
+    """When the project around a cruft folder (its parent) was last worked on,
+    as a Unix timestamp; 0.0 if unknown."""
+    project = os.path.dirname(os.path.realpath(cruft_dir).rstrip(os.sep))
+    times = []
+    for marker in PROJECT_MARKERS:
+        try:
+            times.append(os.stat(os.path.join(project, marker)).st_mtime)
+        except OSError:
+            pass
+    if not times:
+        try:
+            times.append(os.stat(project).st_mtime)
+        except OSError:
+            return 0.0
+    return max(times)
 
 
 def _walk_for_cruft(root: str, found: list[str]) -> None:

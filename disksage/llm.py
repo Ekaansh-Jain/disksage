@@ -2,8 +2,9 @@
 
 Groq, Gemini, and every common *local* runner (Ollama, LM Studio, llama.cpp,
 Jan, LocalAI, text-generation-webui, GPT4All, …) all speak the OpenAI chat API,
-so we use a single client and just swap the base URL + model. "Supporting a
-local LLM" is therefore just pointing at the right localhost port + model.
+so one standard-library HTTP request covers them all: we just swap the base
+URL + model. "Supporting a local LLM" is therefore just pointing at the right
+localhost port + model.
 
 Provider is chosen by DISKSAGE_PROVIDER, else auto-detected in this order:
     local (any detected server)  ->  groq  ->  gemini
@@ -17,7 +18,11 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+import ssl
+import urllib.error
 import urllib.request
+from dataclasses import dataclass
 
 PROVIDERS = {
     "groq": {
@@ -122,60 +127,69 @@ def describe() -> str:
     return f"{cfg['name']} ({cfg['model']})" if cfg else "none (knowledge base only)"
 
 
-from dataclasses import dataclass
-
-
 @dataclass
 class LLMResult:
     content: str | None = None
     error: str | None = None      # human-friendly reason when the call failed
 
 
-def _friendly_error(exc: Exception) -> str:
-    name = type(exc).__name__
-    msg = str(exc)
-    if "Connection" in name or "Connection" in msg or "getaddrinfo" in msg:
-        return "can't reach the AI service — check your internet connection"
-    if "Timeout" in name or "timed out" in msg.lower():
-        return "the AI request timed out"
-    if "Authentication" in name or "401" in msg:
-        return "the API key was rejected — check it in your .env"
-    if "RateLimit" in name or "429" in msg:
-        return "rate limited by the provider — try again in a moment"
-    if "NotFound" in name or "404" in msg or "model" in msg.lower():
-        return "the configured model wasn't found for this provider"
-    return f"AI request failed ({name})"
+def _ssl_context() -> ssl.SSLContext:
+    """Python from python.org (and uv-managed Pythons) may not find macOS's
+    certificates, so prefer certifi's bundle when it's installed."""
+    try:
+        import certifi
+    except ImportError:
+        return ssl.create_default_context()
+    return ssl.create_default_context(cafile=certifi.where())
 
 
-def chat_json(system: str, user: str) -> LLMResult:
+def _http_error(code: int) -> str:
+    return {
+        401: "the API key was rejected — check it with `disksage setup`",
+        403: "the API key was rejected — check it with `disksage setup`",
+        404: "the configured model or endpoint wasn't found for this provider",
+        429: "rate limited by the provider — try again in a moment",
+    }.get(code, f"the AI service returned HTTP {code}")
+
+
+def chat_json(system: str, user: str, timeout: float = 30.0) -> LLMResult:
     """Send one chat request. Returns an LLMResult with either content or a
-    human-friendly error — never raises."""
+    human-friendly error — never raises.
+
+    One OpenAI-compatible POST with the standard library, so there's no SDK
+    (and none of its compiled dependencies) to install."""
     cfg = resolve()
     if not cfg:
         return LLMResult(error="no AI provider configured")
-    try:
-        from openai import OpenAI
-    except ImportError:
-        return LLMResult(error="the `openai` package isn't installed")
 
-    client = OpenAI(base_url=cfg["base_url"], api_key=cfg["api_key"],
-                    timeout=30.0, max_retries=1)
-    messages = [{"role": "system", "content": system},
-                {"role": "user", "content": user}]
-    try:
-        resp = client.chat.completions.create(
-            model=cfg["model"], messages=messages, temperature=0,
-            response_format={"type": "json_object"},
-        )
-    except Exception as first:
-        # Some endpoints reject response_format — retry plain before giving up.
+    url = cfg["base_url"].rstrip("/") + "/chat/completions"
+    body = {
+        "model": cfg["model"],
+        "temperature": 0,
+        "messages": [{"role": "system", "content": system},
+                     {"role": "user", "content": user}],
+        "response_format": {"type": "json_object"},
+    }
+    context = _ssl_context() if url.startswith("https://") else None
+    for _ in range(2):
+        req = urllib.request.Request(
+            url, data=json.dumps(body).encode(), method="POST",
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {cfg['api_key']}"})
         try:
-            resp = client.chat.completions.create(
-                model=cfg["model"], messages=messages, temperature=0,
-            )
-        except Exception:
-            return LLMResult(error=_friendly_error(first))
-    try:
-        return LLMResult(content=resp.choices[0].message.content)
-    except (AttributeError, IndexError):
-        return LLMResult(error="the AI returned an empty response")
+            with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
+                data = json.load(resp)
+            return LLMResult(content=data["choices"][0]["message"]["content"])
+        except urllib.error.HTTPError as exc:
+            # Some local servers reject response_format — retry once without it.
+            if exc.code in (400, 422) and "response_format" in body:
+                del body["response_format"]
+                continue
+            return LLMResult(error=_http_error(exc.code))
+        except (TimeoutError, socket.timeout):
+            return LLMResult(error="the AI request timed out")
+        except (urllib.error.URLError, OSError):
+            return LLMResult(error="can't reach the AI service — check your connection")
+        except (KeyError, IndexError, TypeError, ValueError):
+            return LLMResult(error="the AI returned a response disksage couldn't read")
+    return LLMResult(error="the AI request failed")

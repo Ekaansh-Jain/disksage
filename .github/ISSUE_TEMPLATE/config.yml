@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a safety problem privately
+    url: https://github.com/Ekaansh-Jain/disksage/security/advisories/new
+    about: disksage offered to delete something that wasn't safe? Report it here, not in a public issue.

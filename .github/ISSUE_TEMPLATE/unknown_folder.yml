@@ -1,0 +1,37 @@
+name: Unrecognized or mislabelled folder
+description: disksage didn't know what a folder is, or gave it the wrong label
+labels: ["rule request"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        These reports become rules in `knowledge.py`, so every user benefits. Thank you.
+  - type: input
+    id: path
+    attributes:
+      label: Path
+      description: Use ~ for your home folder.
+      placeholder: ~/Library/Application Support/SomeApp/Cache
+    validations:
+      required: true
+  - type: input
+    id: app
+    attributes:
+      label: Which app or tool creates it?
+  - type: dropdown
+    id: tier
+    attributes:
+      label: What should disksage call it?
+      options:
+        - SAFE (rebuilds itself, nothing is lost)
+        - REVIEW (re-downloadable, but costs time or bandwidth)
+        - KEEP (real data, never offer to delete)
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: How do you know?
+      description: A link to the app's docs, or what happened after you deleted it.
+    validations:
+      required: true

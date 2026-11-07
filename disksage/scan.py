@@ -12,9 +12,14 @@ Only items at or above `min_size` are returned, so the report stays readable.
 from __future__ import annotations
 
 import os
+import stat
 from dataclasses import dataclass
 
 HOME = os.path.expanduser("~")
+
+# macOS <sys/stat.h>: the file's contents live in iCloud / a File Provider, not on
+# this disk. Python 3.13+ exposes it as stat.SF_DATALESS.
+SF_DATALESS = getattr(stat, "SF_DATALESS", 0x40000000)
 
 # Each immediate child of these is a candidate.
 CONTAINER_DIRS = [
@@ -36,7 +41,18 @@ CRUFT_DIR_NAMES = {
     "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache",
     ".mypy_cache", ".ruff_cache", ".turbo", "target", "dist", "build",
     ".next", ".nuxt", ".gradle",
+    # ML leftovers: often big, but they can hold results you can't regenerate,
+    # so they're always REVIEW and never pre-ticked (see knowledge.py).
+    "wandb", "mlruns", "lightning_logs", ".ipynb_checkpoints",
 }
+
+# Files that change when you work on a project. Their newest mtime is a good
+# stand-in for "when did I last work on this".
+PROJECT_MARKERS = (
+    "package.json", "pyproject.toml", "requirements.txt", "setup.py", "Cargo.toml",
+    "go.mod", "pom.xml", "build.gradle", "Gemfile", "composer.json",
+    ".git/index", ".git/HEAD",
+)
 
 # Known heavy singletons worth surfacing directly.
 SINGLETONS = [
@@ -44,7 +60,8 @@ SINGLETONS = [
     os.path.join(HOME, "Library/Arduino15/packages"),
     os.path.join(HOME, "Library/Developer/Xcode/DerivedData"),
     os.path.join(HOME, "Library/Developer/Xcode/iOS DeviceSupport"),
-    os.path.join(HOME, ".Trash"),
+    # (~/.Trash is deliberately not here: it can't be moved into itself, and
+    #  `disksage clean` offers to empty it at the end instead.)
     os.path.join(HOME, ".m2/repository"),
     os.path.join(HOME, ".gradle/caches"),
     # local model stores — big, outside the usual cache/support dirs
@@ -53,8 +70,31 @@ SINGLETONS = [
     os.path.join(HOME, ".keras"),
 ]
 
+# Folders that hold several separately-reclaimable things. Instead of offering
+# the whole folder, each child is its own candidate — e.g. Hugging Face keeps
+# models, datasets, a download cache and your login token side by side.
+NESTED_CONTAINERS = [
+    os.path.join(HOME, ".cache/huggingface"),
+]
+
 # Directories never descended into when hunting for big loose files.
 FILE_WALK_SKIP = CRUFT_DIR_NAMES | {".git"}
+
+# macOS packages: folders Finder shows as a single file. Their insides are an
+# app's data (a Photos library, an app bundle, a Final Cut library, a VM), so we
+# never descend into them and the safety floor never lets anything inside go.
+PACKAGE_SUFFIXES = (
+    ".app", ".bundle", ".framework", ".plugin", ".kext",
+    ".photoslibrary", ".photolibrary", ".aplibrary", ".migratedphotolibrary",
+    ".fcpbundle", ".imovielibrary", ".logicx", ".band", ".musiclibrary", ".tvlibrary",
+    ".lrlibrary", ".xcarchive", ".xcodeproj", ".xcworkspace", ".playground",
+    ".pages", ".numbers", ".key", ".rtfd", ".scriv",
+    ".sparsebundle", ".pvm", ".vmwarevm", ".utm",
+)
+
+
+def is_package(name_or_path: str) -> bool:
+    return name_or_path.rstrip(os.sep).lower().endswith(PACKAGE_SUFFIXES)
 
 MAX_WALK_DEPTH = 6  # don't spelunk forever inside project roots
 
@@ -83,22 +123,59 @@ class Item:
     label: str = ""
     why: str = ""
     source: str = ""
+    # filled in by the CLI for project folders
+    tracked: int = 0           # files under this path that git tracks (source, not output)
+    touched: float = 0.0       # when the project around it was last worked on (Unix time)
 
 
-def dir_size(path: str, stop: set[str] | None = None) -> int:
-    """Total bytes under path, not following symlinks.
+def size_on_disk(st: os.stat_result) -> int:
+    """Bytes a file really occupies.
+
+    st_size is the file's *length*. Sparse files (VM images), cloud placeholders
+    and compressed files take far less space on disk, so totals built from
+    st_size promise space that deleting will never free."""
+    blocks = getattr(st, "st_blocks", None)
+    return blocks * 512 if blocks is not None else st.st_size
+
+
+def is_dataless(st: os.stat_result) -> bool:
+    """True for iCloud / Dropbox / OneDrive placeholders whose contents aren't on
+    this Mac. Deleting one frees nothing locally, and reading one (to hash it)
+    makes macOS download it."""
+    return bool(getattr(st, "st_flags", 0) & SF_DATALESS)
+
+
+def _count_once(st: os.stat_result, seen: set[tuple[int, int]]) -> int:
+    """Bytes on disk for one file, counting a hard-linked file only the first
+    time we meet it (the same bytes can have several names)."""
+    if st.st_nlink > 1:
+        key = (st.st_dev, st.st_ino)
+        if key in seen:
+            return 0
+        seen.add(key)
+    return size_on_disk(st)
+
+
+def dir_size(path: str, stop: set[str] | None = None,
+             seen: set[tuple[int, int]] | None = None) -> int:
+    """Bytes on disk under path, not following symlinks.
 
     `stop` is a set of paths NOT to descend into — used so a parent folder
     doesn't double-count bytes that belong to a separately-listed child
-    (e.g. Application Support/Claude excludes its own vm_bundles)."""
+    (e.g. Application Support/Claude excludes its own vm_bundles).
+
+    `seen` is shared across one whole scan so a hard-linked file is only
+    counted for the first candidate that contains it."""
     stop = stop or set()
+    seen = set() if seen is None else seen
     try:
-        if os.path.islink(path):
-            return 0
-        if os.path.isfile(path):
-            return os.path.getsize(path)
+        st = os.lstat(path)
     except OSError:
         return 0
+    if stat.S_ISLNK(st.st_mode):
+        return 0
+    if not stat.S_ISDIR(st.st_mode):
+        return _count_once(st, seen)
     total = 0
     stack = [path]
     while stack:
@@ -114,12 +191,54 @@ def dir_size(path: str, stop: set[str] | None = None) -> int:
                                 continue  # belongs to a deeper candidate
                             stack.append(entry.path)
                         else:
-                            total += entry.stat(follow_symlinks=False).st_size
+                            total += _count_once(entry.stat(follow_symlinks=False), seen)
                     except OSError:
                         continue
         except OSError:
             continue
     return total
+
+
+def _once_each(paths, follow_symlinks: bool) -> list[str]:
+    """`paths` without the ones that are another name for an earlier one.
+
+    On a case-insensitive disk (the macOS default) ~/Projects and ~/projects
+    are the same folder, and a symlink can alias another root. Walking both
+    listed every project folder twice and counted its size twice.
+
+    Roots are compared following symlinks (an alias of a root *is* that root);
+    candidates are compared without following them, so a symlink is never
+    mistaken for the folder it points to."""
+    seen: set[tuple[int, int]] = set()
+    out = []
+    for p in paths:
+        try:
+            st = os.stat(p) if follow_symlinks else os.lstat(p)
+        except OSError:
+            continue
+        key = (st.st_dev, st.st_ino)
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
+
+
+def project_last_touched(cruft_dir: str) -> float:
+    """When the project around a cruft folder (its parent) was last worked on,
+    as a Unix timestamp; 0.0 if unknown."""
+    project = os.path.dirname(os.path.realpath(cruft_dir).rstrip(os.sep))
+    times = []
+    for marker in PROJECT_MARKERS:
+        try:
+            times.append(os.stat(os.path.join(project, marker)).st_mtime)
+        except OSError:
+            pass
+    if not times:
+        try:
+            times.append(os.stat(project).st_mtime)
+        except OSError:
+            return 0.0
+    return max(times)
 
 
 def _walk_for_cruft(root: str, found: list[str]) -> None:
@@ -131,7 +250,9 @@ def _walk_for_cruft(root: str, found: list[str]) -> None:
         pruned = []
         for name in list(dirnames):
             full = os.path.join(dirpath, name)
-            if name in CRUFT_DIR_NAMES:
+            if is_package(name):
+                pruned.append(name)  # an app's data, never ours to judge
+            elif name in CRUFT_DIR_NAMES:
                 found.append(full)
                 pruned.append(name)  # don't descend into a matched dir
         for name in pruned:
@@ -145,7 +266,9 @@ def _drill_for_buried(root: str, found: list[str]) -> None:
             dirnames[:] = []
             continue
         for name in list(dirnames):
-            if name in BURIED_CACHE_NAMES:
+            if is_package(name):
+                dirnames.remove(name)
+            elif name in BURIED_CACHE_NAMES:
                 found.append(os.path.join(dirpath, name))
                 dirnames.remove(name)  # don't descend further into it
 
@@ -158,7 +281,7 @@ def collect_candidates(root: str | None = None) -> list[str]:
     if root:
         cruft: list[str] = []
         _walk_for_cruft(root, cruft)
-        return sorted(set(cruft))
+        return _once_each(sorted(set(cruft)), follow_symlinks=False)
 
     paths: set[str] = set()
 
@@ -170,8 +293,17 @@ def collect_candidates(root: str | None = None) -> list[str]:
             except OSError:
                 pass
 
+    for nested in NESTED_CONTAINERS:
+        if nested in paths and os.path.isdir(nested):
+            paths.discard(nested)
+            try:
+                for name in os.listdir(nested):
+                    paths.add(os.path.join(nested, name))
+            except OSError:
+                pass
+
     cruft: list[str] = []
-    for root in PROJECT_ROOTS:
+    for root in _once_each(PROJECT_ROOTS, follow_symlinks=True):
         if os.path.isdir(root):
             _walk_for_cruft(root, cruft)
     paths.update(cruft)
@@ -186,7 +318,7 @@ def collect_candidates(root: str | None = None) -> list[str]:
         if os.path.exists(s):
             paths.add(s)
 
-    return sorted(paths)
+    return _once_each(sorted(paths), follow_symlinks=False)
 
 
 def scan_dirs(min_size: int = 20 * 1024 * 1024, root: str | None = None) -> list[Item]:
@@ -194,25 +326,45 @@ def scan_dirs(min_size: int = 20 * 1024 * 1024, root: str | None = None) -> list
 
     Sizes are NON-OVERLAPPING: when one candidate lives inside another, the
     parent's size excludes the child, so the same bytes are never counted
-    twice and every folder shows its own reclaimable weight."""
+    twice and every folder shows its own reclaimable weight. Sizes are bytes
+    on disk, and a hard-linked file counts once across the whole scan."""
     candidates = collect_candidates(root)
     cand_set = set(candidates)
+    seen: set[tuple[int, int]] = set()
 
     items: list[Item] = []
     for path in candidates:
         others = cand_set - {path}
-        size = dir_size(path, stop=others)
+        size = dir_size(path, stop=others, seen=seen)
         if size >= min_size:
             items.append(Item(path=path, size=size, kind="dir"))
     items.sort(key=lambda i: i.size, reverse=True)
     return items
 
 
-def collect_files(file_min: int, roots: list[str] | None = None) -> list[tuple[str, int]]:
-    """All files >= file_min bytes inside the given roots (default: project
-    roots), skipping cruft/.git dirs (already accounted for as directories)."""
-    out: list[tuple[str, int]] = []
-    for root in (roots if roots is not None else PROJECT_ROOTS):
+@dataclass(frozen=True)
+class FileInfo:
+    path: str
+    size: int      # length in bytes: identical files have equal lengths, so group duplicates by this
+    on_disk: int   # bytes allocated: what deleting the file frees; show and total this
+
+
+def collect_files(file_min: int, roots: list[str] | None = None,
+                  stats: dict | None = None) -> list[FileInfo]:
+    """All regular files >= file_min bytes inside the given roots (default:
+    project roots), skipping cruft/.git dirs (already accounted for as
+    directories).
+
+    Never returns the same bytes twice: symlinks are skipped, and only the first
+    name of a hard-linked file is kept, so a file can't be offered as a
+    "duplicate" of itself. Cloud placeholders are skipped (they free nothing and
+    reading them downloads them); pass a `stats` dict to get how many."""
+    out: list[FileInfo] = []
+    seen: set[tuple[int, int]] = set()
+    if stats is not None:
+        stats.setdefault("cloud_only_files", 0)
+        stats.setdefault("cloud_only_bytes", 0)
+    for root in _once_each(roots if roots is not None else PROJECT_ROOTS, follow_symlinks=True):
         if not os.path.isdir(root):
             continue
         base_depth = root.rstrip(os.sep).count(os.sep)
@@ -220,17 +372,26 @@ def collect_files(file_min: int, roots: list[str] | None = None) -> list[tuple[s
             if dirpath.count(os.sep) - base_depth >= MAX_WALK_DEPTH:
                 dirnames[:] = []
                 continue
-            dirnames[:] = [d for d in dirnames if d not in FILE_WALK_SKIP]
+            dirnames[:] = [d for d in dirnames
+                           if d not in FILE_WALK_SKIP and not is_package(d)]
             for name in filenames:
                 fp = os.path.join(dirpath, name)
                 try:
-                    if os.path.islink(fp):
-                        continue
-                    size = os.path.getsize(fp)
+                    st = os.lstat(fp)
                 except OSError:
                     continue
-                if size >= file_min:
-                    out.append((fp, size))
+                if not stat.S_ISREG(st.st_mode) or st.st_size < file_min:
+                    continue  # symlinks, sockets, small files
+                if is_dataless(st):
+                    if stats is not None:
+                        stats["cloud_only_files"] += 1
+                        stats["cloud_only_bytes"] += st.st_size
+                    continue
+                key = (st.st_dev, st.st_ino)
+                if key in seen:
+                    continue  # another name for a file we already have
+                seen.add(key)
+                out.append(FileInfo(fp, st.st_size, size_on_disk(st)))
     return out
 
 

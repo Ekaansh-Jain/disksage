@@ -14,7 +14,6 @@ collide with another file, so unique files cost one stat + at most 4 KB.
 from __future__ import annotations
 
 import hashlib
-import os
 from collections import defaultdict
 
 _HEAD = 4096
@@ -43,7 +42,7 @@ def find_duplicates(files: list[tuple[str, int]]) -> list[list[str]]:
             by_size[size].append(path)
 
     groups: list[list[str]] = []
-    for size, paths in by_size.items():
+    for paths in by_size.values():
         if len(paths) < 2:
             continue
 

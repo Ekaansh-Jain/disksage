@@ -17,6 +17,7 @@ I aim to reply within 3 days, and to release a fix within 7 days for anything th
 - A path offered for deletion that holds real data: documents, photos, app data, credentials, source code
 - A pre-ticked item that doesn't rebuild itself
 - Any way to make the AI mark something SAFE
+- Any way to send folder paths to an AI provider you didn't choose
 - Anything outside your home folder being touched
 - A crash that leaves files half-moved or half-cloned
 
@@ -30,6 +31,7 @@ I aim to reply within 3 days, and to release a fix within 7 days for anything th
 - It only acts inside your home folder.
 - It never offers keychains, app containers, Mail, Messages, Photos and other libraries, iCloud Drive, cloud-sync folders, iPhone backups, credential folders, or anything inside a macOS package.
 - Only items from the built-in list can be SAFE. The AI can label items, never mark them SAFE.
+- Folder paths and sizes go only to the AI provider you chose. With "No AI", nothing is sent anywhere.
 - Caches that rebuild themselves are deleted after you confirm; everything else goes to the Trash.
 - Duplicate models are replaced with APFS clones only after their contents are verified to be identical.
 - Folders with git-tracked files or unpushed commits are flagged and never pre-ticked.

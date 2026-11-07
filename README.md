@@ -82,6 +82,7 @@ Run `disksage setup` and pick a provider: Groq or Google Gemini (free cloud APIs
 
 - Scanning happens on your Mac. Nothing is uploaded unless you set up a cloud AI provider.
 - With a cloud provider, only folder paths (your home folder shown as `~`) and sizes are sent, to the provider you picked. With a local model, nothing leaves your Mac.
+- Choose "No AI" in `disksage setup`, or add `--no-ai`, and nothing is sent anywhere, not even to a local model.
 - No telemetry.
 
 ## When to use something else

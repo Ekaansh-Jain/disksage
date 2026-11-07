@@ -2,9 +2,7 @@
 
 Notable changes to disksage. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
-
-<!-- When you tag v0.2.0, rename this heading to "## [0.2.0] - <date>". -->
+## [0.2.0] - 2026-11-07
 
 ### Added
 
@@ -45,6 +43,13 @@ Notable changes to disksage. The format follows [Keep a Changelog](https://keepa
 - Protected: iCloud Drive, cloud-sync folders, iPhone backups and credential folders (`~/.ssh`, `~/.aws`, `~/.config`, …).
 - Dropped the `openai` dependency: one standard-library HTTP request talks to every provider, and every dependency is pure Python.
 - Requires Python 3.10 or newer.
+
+### Security
+
+- Choosing "No AI" in `disksage setup` turns the AI off. Before, a running local model server, or a Groq or Gemini key exported in your shell, was still used, and the paths and sizes of unrecognized folders were sent to it.
+- A cloud provider is used only when you choose it in `disksage setup` or with `--provider`. A Groq or Gemini key that's set in your shell for another tool is no longer used on its own.
+- disksage no longer reads a `.env` file from the folder you run it in. A `.env` in a cloned project could pick the server that received your folder paths. Settings live in `~/.config/disksage/.env`, and variables set in your shell still work.
+- The settings file that holds your API key is created readable only by you. Before, the key was written first and the file made private afterwards.
 
 ## [0.1.0] - 2026-09-29
 

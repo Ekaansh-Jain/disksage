@@ -13,6 +13,7 @@ Run:  ./.venv/bin/python -m pytest -q
 import hashlib
 import json
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -20,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from disksage import cli, dedup, knowledge, llm, models, safety
+from disksage import cli, config, dedup, knowledge, llm, models, safety
 from disksage.classify import build_file_items
 from disksage.scan import collect_files, dir_size, is_dataless, scan_dirs, size_on_disk
 from disksage.tools import docker_report as real_docker_report  # conftest stubs the module's
@@ -507,6 +508,141 @@ def test_chat_json_unreachable_server(monkeypatch):
     monkeypatch.setenv("DISKSAGE_LOCAL_MODEL", "m")
     res = llm.chat_json("system", "user", timeout=2)
     assert res.content is None and "reach" in res.error
+
+
+# ---- the AI runs only when you chose it ----
+
+def _unset(monkeypatch, *names):
+    """Unset these for one test, and restore them afterwards even when the code
+    under test sets them (config.load and config.save write to os.environ)."""
+    for name in names:
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+
+
+@pytest.fixture
+def user_config(monkeypatch, tmp_path):
+    """disksage's settings file in a throwaway folder, no AI settings in the
+    environment, and no local model server running."""
+    folder = tmp_path / "config" / "disksage"
+    monkeypatch.setattr(config, "CONFIG_DIR", str(folder))
+    monkeypatch.setattr(config, "ENV_PATH", str(folder / ".env"))
+    _unset(monkeypatch, "DISKSAGE_AI", "DISKSAGE_PROVIDER", "DISKSAGE_LOCAL_BASE_URL",
+           "DISKSAGE_LOCAL_MODEL", "LMSTUDIO_BASE_URL", "GROQ_API_KEY", "GEMINI_API_KEY")
+    monkeypatch.setattr(llm, "_LOCAL_CACHE", [])
+    return folder / ".env"
+
+
+@pytest.mark.parametrize("value", ["off", "OFF", "0", "false", "no"])
+def test_no_ai_turns_every_provider_off(user_config, monkeypatch, value):
+    # "No AI" in setup saves DISKSAGE_AI=off. A saved provider, a key in the
+    # shell or a configured local server must not switch the AI back on.
+    monkeypatch.setenv("DISKSAGE_AI", value)
+    monkeypatch.setenv("DISKSAGE_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "from-the-shell")
+    monkeypatch.setenv("DISKSAGE_LOCAL_BASE_URL", "http://127.0.0.1:9/v1")
+    monkeypatch.setenv("DISKSAGE_LOCAL_MODEL", "m")
+    assert llm.resolve() is None
+    assert llm.describe().startswith("off")
+
+
+def test_a_cloud_key_in_the_shell_is_used_only_for_the_provider_you_chose(user_config, monkeypatch):
+    # Many developers export GEMINI_API_KEY or GROQ_API_KEY for other tools.
+    monkeypatch.setenv("GEMINI_API_KEY", "for-another-tool")
+    monkeypatch.setenv("GROQ_API_KEY", "for-another-tool")
+    assert llm.resolve() is None
+    monkeypatch.setenv("DISKSAGE_PROVIDER", "groq")       # what setup saves with the key
+    assert llm.resolve()["name"] == "groq"
+
+
+def test_after_no_ai_a_scan_sends_nothing_and_does_not_ask_again(user_config, monkeypatch,
+                                                                capsys):
+    _make(os.path.join(HOME, "Library/Application Support/StealthStartup/blob.bin"),
+          os.urandom(3 * MB))
+    user_config.parent.mkdir(parents=True)
+    user_config.write_text("DISKSAGE_AI=off\n")           # what "No AI" in setup saves
+    monkeypatch.setenv("DISKSAGE_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "from-the-shell")
+    monkeypatch.setattr(cli, "annotate_with_ai", lambda items: pytest.fail("the AI was asked"))
+    monkeypatch.setattr(llm, "chat_json", lambda *a, **k: pytest.fail("something was sent"))
+    assert cli.main(["scan", "--no-files", "--min-size", "1"]) == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "StealthStartup" in out
+    assert "lets an AI identify them" not in out
+
+
+def test_asking_for_a_provider_turns_the_ai_on_for_that_run(user_config, monkeypatch, local_ai):
+    _make(os.path.join(HOME, "Library/Application Support/AskedForAI/blob.bin"),
+          os.urandom(3 * MB))
+    local_ai("/ok/v1")
+    monkeypatch.setenv("DISKSAGE_AI", "off")
+    asked = []
+    real = cli.annotate_with_ai
+    monkeypatch.setattr(cli, "annotate_with_ai", lambda items: asked.append(items) or real(items))
+    assert cli.main(["scan", "--no-files", "--min-size", "1", "--provider", "local"]) == 0
+    assert asked
+
+
+def test_a_dotenv_in_the_current_folder_is_ignored(user_config, monkeypatch, tmp_path):
+    # Any repo you clone can contain a .env. It must not turn the AI back on
+    # or decide where your folder names go.
+    user_config.parent.mkdir(parents=True)
+    user_config.write_text("DISKSAGE_AI=off\n")
+    repo = tmp_path / "cloned-repo"
+    repo.mkdir()
+    (repo / ".env").write_text("DISKSAGE_AI=on\nDISKSAGE_PROVIDER=local\n"
+                               "DISKSAGE_LOCAL_BASE_URL=http://203.0.113.9/v1\n"
+                               "DISKSAGE_LOCAL_MODEL=m\n")
+    monkeypatch.chdir(repo)
+    config.load()
+    assert os.environ["DISKSAGE_AI"] == "off"
+    assert "DISKSAGE_LOCAL_BASE_URL" not in os.environ
+    assert llm.resolve() is None
+
+
+def test_choosing_a_provider_after_no_ai_turns_the_ai_back_on(user_config):
+    config.save({"DISKSAGE_AI": "off"})
+    assert llm.resolve() is None
+    config.save({"DISKSAGE_PROVIDER": "groq", "GROQ_API_KEY": "gsk_test"})
+    assert llm.resolve()["name"] == "groq"
+
+
+def test_the_key_file_is_private_from_the_moment_it_exists(user_config, monkeypatch):
+    # Writing the key first and running chmod afterwards leaves a moment where
+    # other accounts on the Mac can read it, so nothing may depend on chmod.
+    monkeypatch.setattr(os, "chmod", lambda *a, **k: None)
+    monkeypatch.setattr(os, "fchmod", lambda *a, **k: None)
+    old_umask = os.umask(0o022)                     # the usual default: new files readable by all
+    try:
+        path = config.save({"DISKSAGE_PROVIDER": "groq", "GROQ_API_KEY": "gsk_test"})
+    finally:
+        os.umask(old_umask)
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    assert stat.S_IMODE(os.stat(config.CONFIG_DIR).st_mode) == 0o700
+    assert "GROQ_API_KEY=gsk_test" in user_config.read_text()
+    assert os.listdir(config.CONFIG_DIR) == [".env"]  # no temporary file left behind
+
+
+def test_saving_replaces_a_config_that_others_could_read(user_config):
+    user_config.parent.mkdir(parents=True)
+    user_config.write_text("GROQ_API_KEY=old\n")
+    os.chmod(user_config, 0o644)                    # written by hand, or by an older version
+    config.save({"DISKSAGE_PROVIDER": "groq", "GROQ_API_KEY": "new"})
+    assert stat.S_IMODE(os.stat(user_config).st_mode) == 0o600
+    assert "GROQ_API_KEY=new" in user_config.read_text()
+
+
+def test_a_symlinked_config_stays_a_symlink(user_config, tmp_path):
+    # Dotfile managers such as stow and chezmoi link config files into place.
+    real = tmp_path / "dotfiles" / "disksage.env"
+    real.parent.mkdir()
+    real.write_text("DISKSAGE_AI=off\n")
+    user_config.parent.mkdir(parents=True)
+    user_config.symlink_to(real)
+    config.save({"DISKSAGE_PROVIDER": "groq", "GROQ_API_KEY": "gsk_test"})
+    assert user_config.is_symlink()
+    assert "GROQ_API_KEY=gsk_test" in real.read_text()
+    assert stat.S_IMODE(os.stat(real).st_mode) == 0o600
 
 
 # ---- results first, and only stale project folders pre-ticked ----

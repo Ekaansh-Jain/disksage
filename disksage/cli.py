@@ -1,15 +1,23 @@
 """Command line interface.
 
-    disksage            scan and report (default) — deletes nothing
-    disksage scan       same as above
-    disksage clean      scan, then pick items from a checklist to remove: caches
-                       that rebuild themselves are deleted, everything else goes
-                       to the Trash (per-item y/N when input isn't a terminal)
+    disksage            in a terminal: scan, show what can be freed, then offer
+                        to clean right away using the same scan. When piped,
+                        it's the read-only report.
+    disksage scan       read-only report: a summary first, `--details` for every
+                        item, `--json` for scripts and agents
+    disksage clean      pick what to remove from a checklist: caches that rebuild
+                        themselves are deleted, everything else goes to the
+                        Trash. Reuses a scan from the last 10 minutes
+                        (`--rescan` to scan again)
+    disksage models     every local model, and the ones stored by more than one app
+    disksage dedupe     store duplicate models once, as APFS clones
+    disksage setup      pick an AI provider for unrecognized folders (optional)
+    disksage doctor     show the AI provider and the local model servers it sees
 
-Flags:
-    --min-size MB      ignore items smaller than this (default 20)
+Flags (scan, clean):
+    --min-size MB      ignore folders smaller than this (default 20)
     --provider NAME    force local | groq | gemini
-    --no-ai            knowledge base only, no LLM
+    --no-ai            built-in list only, never call an AI
     --root PATH        scan only this folder, for project folders
                        (node_modules, .venv, build…) and big files
     --dry-run          (clean) show what would happen, change nothing
@@ -24,10 +32,13 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field, fields
 
-from . import __version__, config, llm, models, tools
+from . import __version__, config, knowledge, llm, models, tools
 from .classify import annotate_known, annotate_with_ai, build_file_items, human
 from .safety import (
     empty_trash,
@@ -37,9 +48,19 @@ from .safety import (
     tracked_file_count,
     trash,
 )
-from .scan import CRUFT_DIR_NAMES, collect_files, project_last_touched, scan_dirs
+from .scan import (
+    CRUFT_DIR_NAMES,
+    PROJECT_ROOTS,
+    Item,
+    ScanProgress,
+    project_last_touched,
+    scan_dirs,
+    walk_projects,
+)
 
 HOME = os.path.expanduser("~")
+_REAL_HOME = os.path.realpath(HOME)
+MB = 1024 * 1024
 
 TIER_STYLE = {
     "safe":      ("green",     "SAFE  "),
@@ -48,6 +69,13 @@ TIER_STYLE = {
     "keep":      ("red",       "KEEP  "),
 }
 TIER_ORDER = {"safe": 0, "duplicate": 1, "review": 2, "keep": 3}
+
+# `clean` reuses a scan this recent, so `scan` followed by `clean` doesn't make
+# you wait twice.
+SCAN_REUSE_SECONDS = 10 * 60
+
+# Stand-in path for the checklist entry that runs Docker's own cleanup.
+DOCKER_ITEM = "docker:system-prune"
 
 
 def _console():
@@ -63,34 +91,136 @@ def _free_space() -> str:
     return f"{human(usage.free)} free of {human(usage.total)}"
 
 
-def _print_report(items, con) -> None:
-    items = sorted(items, key=lambda i: (TIER_ORDER.get(i.tier, 3), -i.size))
+def _free_bytes() -> int:
+    return shutil.disk_usage(HOME).free
+
+
+def _short_path(path: str) -> str:
+    """~/x instead of /Users/you/x (also when HOME sits behind a symlink)."""
+    for home in (HOME, _REAL_HOME):
+        if path == home:
+            return "~"
+        if path.startswith(home + os.sep):
+            return "~" + path[len(home):]
+    return path
+
+
+def _display_path(it) -> str:
+    return tools.DOCKER_PRUNE.display if it.kind == "command" else _short_path(it.path)
+
+
+def _whole_tail(parts: list[str], room: int) -> list[str]:
+    """As many whole names from the end of `parts` as fit in `room` columns."""
+    tail: list[str] = []
+    for part in reversed(parts):
+        if sum(map(len, tail)) + len(tail) + len(part) > room:
+            break
+        tail.insert(0, part)
+    return tail
+
+
+def _fit(text: str, budget: int) -> str:
+    """Shorten to `budget` columns by dropping the middle, never cutting a
+    folder name in half. The deepest folders say the most (which project,
+    which cache), so they win over the start of the path:
+    …/old-react-app/node_modules, or ~/Library/…/Service Worker when the start
+    still fits."""
+    if len(text) <= budget:
+        return text
+    parts = text.split(os.sep)
+    if len(parts) < 3:
+        return "…" + text[-(budget - 1):]
+    head = os.sep.join(parts[:2])
+    with_head = _whole_tail(parts[2:], budget - len(head) - 3)   # head + "/…/" + tail
+    without = _whole_tail(parts[1:], budget - 2)                 # "…/" + tail
+    if with_head and len(with_head) >= len(without):
+        return f"{head}{os.sep}…{os.sep}{os.sep.join(with_head)}"
+    if without:
+        return f"…{os.sep}{os.sep.join(without)}"
+    return "…" + text[-(budget - 1):]
+
+
+def _columns() -> int:
+    return shutil.get_terminal_size((100, 24)).columns
+
+
+def _say(con, rich_msg: str, plain_msg: str) -> None:
+    # soft_wrap: let the terminal wrap long lines. Rich would otherwise insert
+    # hard line breaks, splitting paths and commands people copy and paste.
+    con.print(rich_msg, soft_wrap=True) if con else print(plain_msg)
+
+
+@contextmanager
+def _status(con, text: str):
+    """Show a spinner (rich) or a plain line while a slow step runs."""
     if con:
-        from rich.table import Table
-        table = Table(show_lines=False, expand=True)
-        table.add_column("", width=6)
-        table.add_column("Size", justify="right", width=9)
-        table.add_column("What", width=22)
-        table.add_column("Why / path", overflow="fold")
-        for it in items:
-            style, tag = TIER_STYLE[it.tier]
-            src = "🤖" if it.source == "ai" else ""
-            table.add_row(f"[{style}]{tag}[/{style}]", human(it.size),
-                          f"{it.label} {src}".strip(),
-                          f"{it.why}\n[dim]{it.path}[/dim]")
-        con.print(table)
+        with con.status(text):
+            yield
     else:
-        for it in items:
-            _, tag = TIER_STYLE[it.tier]
-            print(f"{tag} {human(it.size):>9}  {it.label:22}  {it.path}")
+        print(text)
+        yield
 
 
-def _totals(items) -> dict[str, int]:
-    out = {"safe": 0, "duplicate": 0, "review": 0, "keep": 0}
-    for it in items:
-        out[it.tier] = out.get(it.tier, 0) + it.size
-    return out
+@contextmanager
+def _live_progress(con, progress: ScanProgress, label: str):
+    """A spinner with a running count of files and bytes, refreshed a few
+    times a second, so a long scan never looks stuck."""
+    if not con:
+        print(f"{label}…")
+        yield
+        return
+    with con.status(f"{label}…") as status:
+        done = threading.Event()
 
+        def refresh():
+            while not done.wait(0.2):
+                status.update(f"{label}… {progress.files:,} files · "
+                              f"{human(progress.bytes)} counted")
+
+        ticker = threading.Thread(target=refresh, daemon=True)
+        ticker.start()
+        try:
+            yield
+        finally:
+            done.set()
+            ticker.join()
+
+
+@contextmanager
+def _bytes_progress(con, total: int, label: str):
+    """A progress bar for reading big files (hashing models). Yields a
+    callback that takes the number of bytes just read."""
+    if not con or total <= 0 or not con.is_terminal:
+        yield lambda n: None
+        return
+    from rich.progress import (
+        BarColumn,
+        DownloadColumn,
+        Progress,
+        TextColumn,
+        TimeRemainingColumn,
+        TransferSpeedColumn,
+    )
+    columns = (TextColumn("{task.description}"), BarColumn(), DownloadColumn(),
+               TransferSpeedColumn(), TimeRemainingColumn())
+    with Progress(*columns, console=con, transient=True) as bar:
+        task = bar.add_task(label, total=total)
+        yield lambda n: bar.advance(task, n)
+
+
+def _ago_short(ts: float) -> str:
+    seconds = max(0, int(time.time() - ts))
+    if seconds < 60:
+        return "just now"
+    minutes = seconds // 60
+    return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+
+
+def _seconds(s: float) -> str:
+    return f"{s:.1f} s" if s < 10 else f"{s:.0f} s"
+
+
+# ---- AI setup ----
 
 def _custom_local(questionary) -> dict:
     base = questionary.text(
@@ -101,10 +231,10 @@ def _custom_local(questionary) -> dict:
     base = base.strip()
     if not base.startswith(("http://", "https://")):
         base = "http://" + base
-    models = llm.list_models(base)
-    if models:
-        model = models[0] if len(models) == 1 else (
-            questionary.select("Which model?", choices=models).ask() or models[0])
+    found = llm.list_models(base)
+    if found:
+        model = found[0] if len(found) == 1 else (
+            questionary.select("Which model?", choices=found).ask() or found[0])
     else:
         print("(couldn't list models from that URL — type the model name to use)")
         model = questionary.text("Model name:").ask()
@@ -206,39 +336,15 @@ def cmd_setup(args=None, first_run: bool = False) -> int:
         values = {"DISKSAGE_AI": "off"}
 
     path = config.save(values)
+    _invalidate_scan()  # labels may change
     print(f"\nSaved to {path}")
     print(f"AI provider: {llm.describe()}")
     if not first_run:
-        print("\nNext:  disksage scan   (report where space went)")
-        print("       disksage clean  (pick items to free up)")
+        print("\nNext:  disksage   (scan, then choose what to clean)")
     return 0
 
 
-def _print_provider_banner(con) -> None:
-    cfg = llm.resolve()
-    if cfg:
-        msg = (f"AI: {cfg['name']} ({cfg['model']}) — only file paths + sizes "
-               f"are sent for labelling, never file contents.")
-        con.print(f"[dim]{msg}[/dim]") if con else print(msg)
-        return
-    msg = "No AI configured — using the built-in list only."
-    con.print(f"[dim]{msg}[/dim]") if con else print(msg)
-
-
-def _say(con, rich_msg: str, plain_msg: str) -> None:
-    con.print(rich_msg) if con else print(plain_msg)
-
-
-@contextmanager
-def _status(con, text: str):
-    """Show a spinner (rich) or a plain line while a slow step runs."""
-    if con:
-        with con.status(text):
-            yield
-    else:
-        print(text)
-        yield
-
+# ---- project folders: git-tracked or stale ----
 
 # Project folders that rebuild from the project's own files (npm install, a
 # fresh venv, the next build). Only these get pre-ticked, and only in projects
@@ -270,12 +376,20 @@ def _flag_project_folders(items) -> None:
     - A folder named like build output can still hold source code that git
       tracks. Flag those so they're never pre-ticked and the user sees why.
     - Otherwise note when the project was last worked on, so only stale
-      projects get their rebuildable folders pre-ticked."""
-    for it in items:
+      projects get their rebuildable folders pre-ticked.
+
+    The git checks are one `git ls-files` process per folder. They wait on
+    git, not on Python, so they run side by side."""
+    folders = [it for it in items
+               if it.kind == "dir" and os.path.basename(it.path) in CRUFT_DIR_NAMES]
+    if len(folders) > 1:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            counts = list(pool.map(lambda it: tracked_file_count(it.path), folders))
+    else:
+        counts = [tracked_file_count(it.path) for it in folders]
+    for it, count in zip(folders, counts, strict=True):
         name = os.path.basename(it.path)
-        if it.kind != "dir" or name not in CRUFT_DIR_NAMES:
-            continue
-        it.tracked = tracked_file_count(it.path)
+        it.tracked = count
         if it.tracked:
             it.tier = "review"
             it.why = (f"⚠ {it.tracked} file(s) here are tracked by git: "
@@ -284,142 +398,6 @@ def _flag_project_folders(items) -> None:
         it.touched = project_last_touched(it.path)
         if it.touched and name in REBUILDABLE:
             it.why = f"{it.why}; project last touched {_ago(it.touched)}"
-
-
-def _scan_and_classify(args, con):
-    mb = 1024 * 1024
-    _print_provider_banner(con)
-
-    with _status(con, "Scanning disk…"):
-        dir_items = scan_dirs(min_size=args.min_size * mb, root=args.root)
-
-    unknown = annotate_known(dir_items)
-    _flag_project_folders(dir_items)
-    provider = llm.resolve()
-    if not args.no_ai and unknown and not provider:
-        # Results first; the AI is an optional extra, offered once we know it helps.
-        size = human(sum(u.size for u in unknown))
-        _say(con,
-             f"[yellow]{len(unknown)} folder(s) ({size}) aren't in the built-in list and stay "
-             f"REVIEW.[/yellow] [dim]Run `disksage setup` to let an AI identify them "
-             f"(it only sees paths and sizes).[/dim]",
-             f"{len(unknown)} folder(s) ({size}) aren't in the built-in list. "
-             f"Run `disksage setup` to let an AI identify them.")
-    if not args.no_ai and unknown and provider:
-        with _status(con, f"Identifying {len(unknown)} unrecognized item(s) with {provider['name']}…"):
-            outcome = annotate_with_ai(unknown)
-        if outcome.ok:
-            _say(con,
-                 f"[green]✓ Identified {outcome.labeled}/{outcome.total} unknown item(s) with {provider['name']}.[/green]",
-                 f"Identified {outcome.labeled}/{outcome.total} unknown items with {provider['name']}.")
-        else:
-            _say(con,
-                 f"[yellow]⚠ AI unavailable — {outcome.message}.\n"
-                 f"  Falling back to the knowledge base; {outcome.total} folder(s) stay labelled 'review'.[/yellow]",
-                 f"AI unavailable — {outcome.message}. "
-                 f"Falling back to the knowledge base; {outcome.total} folders stay labelled 'review'.")
-
-    file_items = []
-    if not args.no_files:
-        roots = [args.root] if args.root else None
-        stats: dict = {}
-        with _status(con, "Checking big files & duplicates…"):
-            files = collect_files(file_min=args.dup_size * mb, roots=roots, stats=stats)
-            file_items = build_file_items(files, big_min=args.big_size * mb)
-        if stats.get("cloud_only_files"):
-            # Placeholders free nothing locally, and reading them would download them.
-            _say(con,
-                 f"[dim]Skipped {stats['cloud_only_files']} file(s) "
-                 f"({human(stats['cloud_only_bytes'])}) that are only in iCloud or another "
-                 f"cloud drive; deleting them wouldn't free space on this Mac.[/dim]",
-                 f"Skipped {stats['cloud_only_files']} cloud-only file(s) "
-                 f"({human(stats['cloud_only_bytes'])}).")
-
-    return dir_items + file_items
-
-
-def cmd_scan(args) -> int:
-    con = _console()
-    items = _scan_and_classify(args, con)
-    if not items:
-        print("Nothing above the size threshold. Try --min-size 5.")
-        return 0
-    _print_report(items, con)
-
-    legend = ("Legend  🤖 = labelled by AI (others from the built-in list)   ·   "
-              "SAFE rebuilds itself   ·   REVIEW check first (goes to the Trash)   ·   "
-              "KEEP left alone")
-    con.print(f"[dim]{legend}[/dim]") if con else print(legend)
-
-    t = _totals(items)
-    reclaimable = t["safe"] + t["duplicate"] + t["review"]
-    non_cache = t["duplicate"] + t["review"]
-    if reclaimable > 0 and non_cache > 0:
-        headline = (f"\n{human(reclaimable)} reclaimable — only {human(t['safe'])} is cache.\n"
-                    f"The rest is dev cruft, duplicates & large files a cache cleaner misses.")
-        con.print(f"[bold]{headline}[/bold]") if con else print(headline)
-    msg = (f"\nBreakdown → cache: {human(t['safe'])}   "
-           f"duplicates: {human(t['duplicate'])}   review: {human(t['review'])}   "
-           f"(keep: {human(t['keep'])})\n"
-           f"Disk: {_free_space()}")
-    con.print(msg) if con else print(msg)
-
-    _print_tool_tips(con)
-    _print_model_hint(con)
-
-    hint = ("\nThis was a read-only report — nothing was deleted.\n"
-            "→ Run `disksage clean` to pick items from a checklist and free space.")
-    con.print(f"[bold]{hint}[/bold]") if con else print(hint)
-    return 0
-
-
-def _print_model_hint(con) -> None:
-    """Point at `disksage models` when two apps hold model files of exactly the
-    same size. Only sizes are compared here (no hashing), so scan stays fast."""
-    sizes: dict[int, set[str]] = {}
-    for f in models.all_model_files():
-        sizes.setdefault(f.size, set()).add(f.store)
-    if any(len(stores) > 1 for stores in sizes.values()):
-        _say(con, "\n[bold]Some models look like they're stored by more than one app.[/bold] "
-                  "Run `disksage models` to check, and `disksage dedupe` to store each once.",
-             "\nSome models look like they're stored by more than one app. "
-             "Run `disksage models` to check.")
-
-
-def _print_tool_tips(con) -> None:
-    """Space a file scan can't judge: Docker's disk image, and tools that can
-    clean up after themselves while keeping what's still in use."""
-    usage = tools.docker_usage()
-    if usage:
-        _say(con, "\n[bold]Docker[/bold] (inside its own disk image; `disksage clean` "
-                  "can run Docker's cleanup for you):",
-             "\nDocker (inside its own disk image; `disksage clean` can run Docker's cleanup):")
-        print("\n".join(f"  {line}" for line in usage.splitlines()))
-    tips = [c for c in tools.available() if c.tool != "docker"]
-    if tips:
-        _say(con, "\n[bold]Your tools' own cleanup commands[/bold] "
-                  "(they keep what you still use; disksage doesn't run these):",
-             "\nYour tools' own cleanup commands (disksage doesn't run these):")
-        for c in tips:
-            print(f"  {c.display:<34} {c.removes}")
-
-
-def _ask(prompt: str) -> str:
-    try:
-        return input(prompt).strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return "n"
-
-
-def _tui_available() -> bool:
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        return False
-    try:
-        import questionary  # noqa: F401
-        return True
-    except ImportError:
-        return False
 
 
 def _default_checked(it) -> bool:
@@ -436,24 +414,596 @@ def _default_checked(it) -> bool:
             and os.path.basename(it.path) in REBUILDABLE and _is_stale(it))
 
 
-def _short_path(path: str) -> str:
-    return "~" + path[len(HOME):] if path.startswith(HOME) else path
+def _deletes_directly(it) -> bool:
+    """Caches that rebuild themselves (SAFE in the built-in list) are deleted
+    outright: in the Trash they'd free nothing until it's emptied. Anything
+    that could be yours (REVIEW, duplicates, AI-labelled items) goes to the
+    Trash instead."""
+    return it.tier == "safe" and it.source == "knowledge" and not getattr(it, "tracked", 0)
 
 
-_TIER_HEADINGS = {
-    "safe": "SAFE — rebuilds itself; deleted directly",
-    "duplicate": "DUPLICATES — one original is always kept; tick the copies you don't need",
-    "review": "REVIEW — reclaimable, but check first",
+# ---- scanning ----
+
+@dataclass
+class ScanResult:
+    items: list
+    files_seen: int = 0
+    seconds: float = 0.0
+    created: float = field(default_factory=time.time)
+    cloud_only_files: int = 0
+    cloud_only_bytes: int = 0
+    unknown_count: int = 0        # folders neither the built-in list nor the AI identified
+    unknown_bytes: int = 0
+    suggest_setup: bool = False   # no AI configured, and it could have helped
+    docker: tools.DockerReport | None = None
+    dupes: models.DuplicateEstimate | None = None
+    options: dict = field(default_factory=dict)
+
+
+def _scan_options(args) -> dict:
+    """What a reused scan must have been run with."""
+    return {
+        "min_size": args.min_size, "big_size": args.big_size, "dup_size": args.dup_size,
+        "no_files": bool(args.no_files), "no_ai": bool(args.no_ai),
+        "root": os.path.realpath(args.root) if args.root else None,
+        "provider": os.environ.get("DISKSAGE_PROVIDER", ""),
+    }
+
+
+def _estimate_model_duplicates() -> models.DuplicateEstimate | None:
+    """Fast (no file is read), and optional: a failure here must never cost the
+    user their scan."""
+    try:
+        return models.estimate_duplicates(models.all_model_files())
+    except Exception:
+        return None
+
+
+def _print_provider_banner(con) -> None:
+    cfg = llm.resolve()
+    if cfg:
+        msg = (f"AI: {cfg['name']} ({cfg['model']}) labels folders the built-in list "
+               f"doesn't know. It sees only paths and sizes, never file contents.")
+        con.print(f"[dim]{msg}[/dim]") if con else print(msg)
+
+
+def _scan(args, con) -> ScanResult:
+    """Scan, classify and remember the result for `clean`."""
+    _print_provider_banner(con)
+    progress = ScanProgress()
+    roots = [args.root] if args.root else PROJECT_ROOTS
+    file_min = None if args.no_files else args.dup_size * MB
+
+    with ThreadPoolExecutor(max_workers=2) as side:
+        # Docker and the model stores are asked in parallel with the file scan.
+        # (A --root scan is about one folder, so skip them there.)
+        docker_job = None if args.root else side.submit(tools.docker_report)
+        dupes_job = None if args.root else side.submit(_estimate_model_duplicates)
+        with _live_progress(con, progress, "Scanning"):
+            walk = walk_projects(roots, file_min=file_min, progress=progress)
+            dir_items = scan_dirs(min_size=args.min_size * MB, root=args.root,
+                                  cruft=walk.cruft, progress=progress)
+        docker = docker_job.result() if docker_job else None
+        dupes = dupes_job.result() if dupes_job else None
+
+    unknown = annotate_known(dir_items)
+    _flag_project_folders(dir_items)
+    provider = None if args.no_ai else llm.resolve()
+    if unknown and provider:
+        with _status(con, f"Identifying {len(unknown)} unrecognized folder(s) "
+                          f"with {provider['name']}…"):
+            outcome = annotate_with_ai(unknown)
+        if outcome.ok:
+            _say(con, f"[green]✓ Identified {outcome.labeled}/{outcome.total} unknown "
+                      f"folder(s) with {provider['name']}.[/green]",
+                 f"Identified {outcome.labeled}/{outcome.total} unknown folders "
+                 f"with {provider['name']}.")
+        else:
+            _say(con, f"[yellow]⚠ AI unavailable: {outcome.message}. "
+                      f"{outcome.total} folder(s) stay REVIEW.[/yellow]",
+                 f"AI unavailable: {outcome.message}. {outcome.total} folders stay REVIEW.")
+
+    file_items = (build_file_items(walk.files, big_min=args.big_size * MB)
+                  if file_min is not None else [])
+    items = dir_items + file_items
+    still_unknown = [i for i in items if i.source == "unknown"]
+    result = ScanResult(
+        items=items, files_seen=progress.files, seconds=progress.seconds,
+        cloud_only_files=walk.cloud_only_files, cloud_only_bytes=walk.cloud_only_bytes,
+        unknown_count=len(still_unknown), unknown_bytes=sum(i.size for i in still_unknown),
+        suggest_setup=bool(still_unknown) and not args.no_ai and provider is None,
+        docker=docker, dupes=dupes, options=_scan_options(args))
+    _say(con, f"[dim]Scanned {progress.files:,} files in {_seconds(progress.seconds)}.[/dim]",
+         f"Scanned {progress.files:,} files in {_seconds(progress.seconds)}.")
+    _save_scan(result)
+    return result
+
+
+# ---- remembering the last scan ----
+
+def _scan_cache_path() -> str:
+    return os.path.join(models.STATE_DIR, "last-scan.json")
+
+
+def _save_scan(result: ScanResult) -> None:
+    data = {
+        "version": __version__,
+        "created": result.created,
+        "options": result.options,
+        "files_seen": result.files_seen,
+        "seconds": result.seconds,
+        "cloud_only_files": result.cloud_only_files,
+        "cloud_only_bytes": result.cloud_only_bytes,
+        "unknown_count": result.unknown_count,
+        "unknown_bytes": result.unknown_bytes,
+        "suggest_setup": result.suggest_setup,
+        "docker": ({"rows": [list(r) for r in result.docker.rows],
+                    "reclaimable": result.docker.reclaimable} if result.docker else None),
+        "dupes": asdict(result.dupes) if result.dupes else None,
+        "items": [asdict(i) for i in result.items],
+    }
+    path = _scan_cache_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        # It lists paths on your disk: readable by you only.
+        with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass  # remembering is a convenience; never fail a scan over it
+
+
+def _invalidate_scan() -> None:
+    with contextlib.suppress(OSError):
+        os.remove(_scan_cache_path())
+
+
+_ITEM_FIELDS = {f.name for f in fields(Item)}
+
+
+def _rederive(items: list) -> None:
+    """Tiers come from the rules, never from the saved file: only paths and
+    sizes are reused. An old or edited file can't make anything SAFE."""
+    for it in items:
+        if it.kind == "dir" and it.source == "knowledge":
+            hit = knowledge.look_up(it.path)
+            if hit:
+                it.tier, it.label, it.why = hit.tier, hit.label, hit.why
+            else:
+                it.tier, it.label, it.why, it.source = (
+                    "review", "unrecognized", "not in knowledge base", "unknown")
+        elif it.kind == "duplicate":
+            it.tier = "duplicate"
+        elif it.tier != "keep":
+            it.tier = "review"
+        it.tracked, it.touched = 0, 0.0
+    _flag_project_folders(items)
+
+
+def _load_scan(args) -> ScanResult | None:
+    """The last scan, if it's recent, was made with the same options, and by
+    this version. Items whose files are gone are dropped."""
+    try:
+        with open(_scan_cache_path()) as f:
+            data = json.load(f)
+        if data.get("version") != __version__ or data.get("options") != _scan_options(args):
+            return None
+        created = float(data.get("created", 0))
+        if not 0 <= time.time() - created <= SCAN_REUSE_SECONDS:
+            return None
+        items = []
+        for raw in data.get("items", []):
+            if not isinstance(raw, dict):
+                continue
+            it = Item(**{k: v for k, v in raw.items() if k in _ITEM_FIELDS})
+            # Only plain absolute paths that still exist; scans never produce "..".
+            if (isinstance(it.path, str) and os.path.isabs(it.path)
+                    and os.path.normpath(it.path) == it.path and os.path.lexists(it.path)
+                    and isinstance(it.size, int)):
+                items.append(it)
+        _rederive(items)
+        docker = data.get("docker")
+        dupes = data.get("dupes")
+        return ScanResult(
+            items=items, files_seen=int(data.get("files_seen", 0)),
+            seconds=float(data.get("seconds", 0)), created=created,
+            cloud_only_files=int(data.get("cloud_only_files", 0)),
+            cloud_only_bytes=int(data.get("cloud_only_bytes", 0)),
+            unknown_count=int(data.get("unknown_count", 0)),
+            unknown_bytes=int(data.get("unknown_bytes", 0)),
+            suggest_setup=bool(data.get("suggest_setup")),
+            docker=(tools.DockerReport(tuple(tuple(r) for r in docker["rows"]),
+                                       int(docker["reclaimable"])) if docker else None),
+            dupes=models.DuplicateEstimate(**dupes) if dupes else None,
+            options=data["options"])
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+# ---- the summary: what can be freed, grouped by what it costs you ----
+
+@dataclass
+class Bucket:
+    key: str
+    size: int
+    effect: str
+    what: str
+    approx: bool = False   # an estimate (duplicate models matched by size, not yet hashed)
+
+
+BUCKET_STYLE = {"now": "green", "dedupe": "green", "stale": "yellow",
+                "models": "yellow", "docker": "cyan", "judge": "white"}
+
+# Checklist sections, in the order the summary lists them.
+SECTION_HEADINGS = {
+    "now": "NOTHING LOST · caches that rebuild themselves (deleted)",
+    "stale": "REBUILD IF NEEDED · projects untouched for a while (to the Trash)",
+    "models": "RE-DOWNLOAD IF NEEDED · local models (to the Trash; `disksage models` is gentler)",
+    "docker": "DOCKER'S OWN CLEANUP",
+    "judge": "YOURS TO JUDGE · to the Trash",
 }
 
 
-def _fit_path(path: str, budget: int) -> str:
-    """Shorten a path to `budget` columns, keeping the meaningful tail
-    (filename / deepest folders) and dropping the middle."""
-    p = _short_path(path)
-    if len(p) <= budget:
-        return p
-    return "…" + p[-(budget - 1):]
+def _model_stores() -> set[str]:
+    return {os.path.realpath(p) for p in models.model_dirs().values()}
+
+
+def _bucket_of(it, stores: set[str]) -> str:
+    if it.kind == "command":
+        return "docker"
+    if _deletes_directly(it):
+        return "now"
+    if _default_checked(it):
+        return "stale"
+    if it.kind == "dir":
+        real = os.path.realpath(it.path)
+        if any(real == s or real.startswith(s + os.sep) for s in stores):
+            return "models"
+    return "judge"
+
+
+def _actionable(result: ScanResult) -> list:
+    return [i for i in result.items if i.tier in ("safe", "duplicate", "review")]
+
+
+def _buckets(result: ScanResult) -> tuple[list[Bucket], list]:
+    """The summary lines, plus the items left alone (KEEP).
+
+    Duplicate models live inside the model folders, so "nothing deleted"
+    (dedupe) and "re-download" (deleting models) split those folders' bytes
+    instead of counting them twice."""
+    stores = _model_stores()
+    groups: dict[str, list] = {"now": [], "stale": [], "models": [], "judge": []}
+    kept = []
+    for it in result.items:
+        if it.tier == "keep":
+            kept.append(it)
+        elif it.tier in ("safe", "duplicate", "review"):
+            groups[_bucket_of(it, stores)].append(it)
+
+    def total(key):
+        return sum(i.size for i in groups[key])
+
+    buckets = []
+    if groups["now"]:
+        n = len(groups["now"])
+        buckets.append(Bucket("now", total("now"), "nothing lost",
+                              f"{n} cache{'s' if n != 1 else ''} that rebuild themselves"))
+    dedupe = result.dupes.reclaimable if result.dupes else 0
+    if dedupe:
+        n = result.dupes.groups
+        buckets.append(Bucket("dedupe", dedupe, "nothing deleted",
+                              f"{n} model{'s' if n != 1 else ''} stored by more than one app"
+                              f" · disksage dedupe", approx=not result.dupes.exact))
+    if groups["stale"]:
+        n = len(groups["stale"])
+        projects = len({os.path.dirname(i.path) for i in groups["stale"]})
+        buckets.append(Bucket("stale", total("stale"), "rebuild if needed",
+                              f"{n} folder{'s' if n != 1 else ''} in {projects} "
+                              f"project{'s' if projects != 1 else ''} untouched for "
+                              f"{STALE_DAYS}+ days"))
+    models_rest = max(0, total("models") - dedupe) if groups["models"] else 0
+    if models_rest:
+        buckets.append(Bucket("models", models_rest, "re-download if needed",
+                              "the local models themselves · disksage models"))
+    docker = result.docker.reclaimable if result.docker else 0
+    if docker:
+        buckets.append(Bucket("docker", docker, "Docker's own cleanup",
+                              "unused images, containers and build cache"))
+    if groups["judge"]:
+        judge = sorted(groups["judge"], key=lambda i: -i.size)
+        labels = list(dict.fromkeys(i.label for i in judge if i.label))
+        examples = ", ".join(labels[:2]) + ("…" if len(labels) > 2 else "")
+        n = len(judge)
+        buckets.append(Bucket("judge", total("judge"), "yours to judge",
+                              f"{n} other item{'s' if n != 1 else ''}"
+                              + (f": {examples}" if examples else "")))
+    return buckets, kept
+
+
+def _item_notes(it) -> list[str]:
+    """A short note for the biggest-items list, longest wording first."""
+    if it.kind == "duplicate" and it.original:
+        return [f"same as {_short_path(it.original)}", "duplicate"]
+    if getattr(it, "tracked", 0):
+        return ["tracked by git"]
+    if it.touched and os.path.basename(it.path) in REBUILDABLE:
+        return [f"last touched {_ago(it.touched)}", _ago(it.touched)]
+    return []
+
+
+def _path_and_note(it, room: int) -> tuple[str, str]:
+    """Fit a path and its note into `room` columns. The path matters more (it
+    says which project or cache), so the note gets shorter, then disappears,
+    before the path is shortened."""
+    path = _display_path(it)
+    for note in _item_notes(it):
+        if len(path) + len(note) + 3 <= room:
+            return path, note
+    return _fit(path, room), ""
+
+
+def _print_summary(result: ScanResult, con, top: int = 8) -> None:
+    buckets, kept = _buckets(result)
+    total = sum(b.size for b in buckets)
+    free = human(_free_bytes())
+    if not buckets:
+        _say(con, f"\n[bold]Nothing worth cleaning above the size threshold[/bold] "
+                  f"({free} free). Try --min-size 5.",
+             f"\nNothing worth cleaning above the size threshold ({free} free). "
+             f"Try --min-size 5.")
+    else:
+        approx = "≈" if any(b.approx for b in buckets) else ""
+        _say(con, f"\n[bold]Free up to {approx}{human(total)} on this Mac[/bold] · "
+                  f"{free} free now\n",
+             f"\nFree up to {approx}{human(total)} on this Mac · {free} free now\n")
+        for b in buckets:
+            style = BUCKET_STYLE.get(b.key, "white")
+            size = ("≈" if b.approx else "") + human(b.size)
+            _say(con, f"  {size:>10}  [{style}]{b.effect:<22}[/{style}] {b.what}",
+                 f"  {size:>10}  {b.effect:<22} {b.what}")
+        if any(b.approx for b in buckets):
+            _say(con, "  [dim]≈ matched by size; `disksage dedupe` checks every file "
+                      "before changing it[/dim]",
+                 "  ≈ matched by size; `disksage dedupe` checks every file before changing it")
+    if kept:
+        n = len(kept)
+        _say(con, f"\n  [dim]Left alone: {n} item{'s' if n != 1 else ''} of your data "
+                  f"({human(sum(i.size for i in kept))})[/dim]",
+             f"\n  Left alone: {n} item(s) of your data ({human(sum(i.size for i in kept))})")
+
+    biggest = sorted(_actionable(result), key=lambda i: -i.size)[:top]
+    if biggest:
+        width = max(40, _columns())
+        _say(con, "\n[bold]Biggest items[/bold]", "\nBiggest items")
+        for it in biggest:
+            label = it.label if len(it.label) <= 24 else it.label[:23] + "…"
+            path, note = _path_and_note(it, max(24, width - 42))
+            _say(con, f"  {human(it.size):>10}  {label:<24}  {path}"
+                      + (f" [dim]· {note}[/dim]" if note else ""),
+                 f"  {human(it.size):>10}  {label:<24}  {path}" + (f" · {note}" if note else ""))
+
+    notes = []
+    if result.suggest_setup and result.unknown_count:
+        n = result.unknown_count
+        notes.append(f"{n} folder{'s' if n != 1 else ''} ({human(result.unknown_bytes)}) aren't "
+                     f"in the built-in list. `disksage setup` lets an AI identify them "
+                     f"(it sees only paths and sizes).")
+    if result.cloud_only_files:
+        notes.append(f"Skipped {result.cloud_only_files} file(s) "
+                     f"({human(result.cloud_only_bytes)}) that are only in iCloud or another "
+                     f"cloud drive: deleting them wouldn't free space here.")
+    tips = [c.display for c in tools.available() if c.tool != "docker"]
+    if tips:
+        notes.append("Your tools' own cleanups (they keep what you still use): "
+                     + " · ".join(tips))
+    if notes:
+        print()
+        for note in notes:
+            _say(con, f"[dim]{note}[/dim]", note)
+
+
+def _print_report(items, con) -> None:
+    """Every item, as a table (`scan --details`)."""
+    items = sorted(items, key=lambda i: (TIER_ORDER.get(i.tier, 3), -i.size))
+    if con:
+        from rich.table import Table
+        table = Table(show_lines=False, expand=True)
+        table.add_column("", width=6)
+        table.add_column("Size", justify="right", width=9)
+        table.add_column("What", width=22)
+        table.add_column("Why / path", overflow="fold")
+        for it in items:
+            style, tag = TIER_STYLE[it.tier]
+            src = "🤖" if it.source == "ai" else ""
+            table.add_row(f"[{style}]{tag}[/{style}]", human(it.size),
+                          f"{it.label} {src}".strip(),
+                          f"{it.why}\n[dim]{_short_path(it.path)}[/dim]")
+        con.print(table)
+        con.print("[dim]🤖 = labelled by AI · SAFE rebuilds itself · REVIEW goes to the Trash"
+                  " · KEEP is never touched[/dim]")
+    else:
+        for it in items:
+            _, tag = TIER_STYLE[it.tier]
+            print(f"{tag} {human(it.size):>9}  {it.label:22}  {_short_path(it.path)}")
+
+
+def _print_docker_rows(report: tools.DockerReport) -> None:
+    print(f"  {'':12}{'size':>12}{'reclaimable':>20}")
+    for kind, size, reclaimable in report.rows:
+        print(f"  {kind:<12}{size:>12}{reclaimable:>20}")
+
+
+# ---- commands ----
+
+def cmd_scan(args) -> int:
+    con = _console()
+    result = _scan(args, con)
+    if args.details:
+        _print_report(result.items, con)
+        if result.docker:
+            print("\nDocker (inside its own disk image):")
+            _print_docker_rows(result.docker)
+    _print_summary(result, con, top=0 if args.details else 8)
+    more = "" if args.details else " · `--details` lists every item"
+    _say(con, f"\n[bold]Nothing was changed.[/bold] Next: `disksage clean` to choose what "
+              f"to remove{more}",
+         f"\nNothing was changed. Next: `disksage clean` to choose what to remove{more}")
+    return 0
+
+
+def cmd_home(args) -> int:
+    """`disksage` in a terminal: scan, summarize, then clean using the same scan."""
+    con = _console()
+    result = _scan(args, con)
+    _print_summary(result, con)
+    if not _actionable(result) and not (result.docker and result.docker.reclaimable):
+        return 0
+    if _ask("\nReview and clean now? [Y/n] ") in ("n", "no"):
+        print("Nothing changed. `disksage clean` picks up from this scan for the next "
+              f"{SCAN_REUSE_SECONDS // 60} minutes.")
+        return 0
+    return _clean(result, args, con)
+
+
+def cmd_clean(args) -> int:
+    con = _console()
+    result = None if args.rescan else _load_scan(args)
+    if result:
+        _say(con, f"[dim]Using the scan from {_ago_short(result.created)} "
+                  f"({len(result.items)} items). Add --rescan to scan again.[/dim]",
+             f"Using the scan from {_ago_short(result.created)}. Add --rescan to scan again.")
+    else:
+        result = _scan(args, con)
+    return _clean(result, args, con)
+
+
+def _docker_item(result: ScanResult):
+    report = result.docker
+    if not report or report.reclaimable <= 0:
+        return None
+    return Item(path=DOCKER_ITEM, size=report.reclaimable, kind="command", tier="review",
+                label="Docker cleanup", why=tools.DOCKER_PRUNE.removes, source="docker")
+
+
+def _clean(result: ScanResult, args, con) -> int:
+    actionable = _actionable(result)
+    docker = _docker_item(result)
+    if docker:
+        actionable.append(docker)
+    if not actionable:
+        print("Nothing to clean.")
+        return 0
+
+    total = sum(i.size for i in actionable)
+    _say(con, f"\n[bold]Choose what to clean[/bold] · {len(actionable)} items, up to "
+              f"{human(total)}. Caches are deleted; everything else goes to the Trash.",
+         f"\nChoose what to clean: {len(actionable)} items, up to {human(total)}.")
+    queue = _select_tui(actionable) if _tui_available() else _select_prompts(actionable)
+    if not queue:
+        print("\nNothing selected. Nothing changed.")
+        return 0
+
+    # ---- final review + one explicit confirmation before anything moves ----
+    deletes = [i for i in queue if _deletes_directly(i)]
+    commands = [i for i in queue if i.kind == "command"]
+    trashes = [i for i in queue if i not in deletes and i not in commands]
+    print(f"\n{'─' * 60}")
+    print(f"About to clean {len(queue)} item(s), {human(sum(i.size for i in queue))}:")
+    risky = 0
+    for heading, group in (
+            ("Delete (caches that rebuild themselves):", deletes),
+            ("Move to the Trash (you can get these back):", trashes),
+            ("Run Docker's own cleanup:", commands)):
+        if not group:
+            continue
+        print(f"\n  {heading}")
+        for it in group:
+            _, tag = TIER_STYLE[it.tier]
+            line = f"    {tag} {human(it.size):>9}  {_display_path(it)}"
+            risk = git_risk(it.path) if it.kind == "dir" else None
+            if getattr(it, "tracked", 0):
+                tracked = f"{it.tracked} file(s) tracked by git: source, not build output"
+                risk = f"{risk}; {tracked}" if risk else tracked
+            if risk:
+                line += f"\n        ⚠️  {risk}"
+                risky += 1
+            print(line)
+    if risky:
+        print(f"\n  ⚠️  {risky} item(s) above carry a git warning — review them.")
+
+    if getattr(args, "dry_run", False):
+        print("\nDry run: nothing was deleted or moved.")
+        return 0
+
+    if _ask(f"\nType 'yes' to clean these {len(queue)} item(s): ") != "yes":
+        print("Aborted. Nothing was deleted.")
+        return 0
+
+    free_before = _free_bytes()
+    trashed = done = 0
+    try:
+        for n, it in enumerate(queue, 1):
+            step = f"{n}/{len(queue)} · {_display_path(it)} ({human(it.size)})"
+            if it.kind == "command":
+                with _status(con, f"Running {tools.DOCKER_PRUNE.display}…"):
+                    ok, last = tools.run(tools.DOCKER_PRUNE)
+                print(f"  {'ran' if ok else 'FAILED'}: {tools.DOCKER_PRUNE.display}"
+                      + (f" ({last})" if last else ""))
+                done += 1
+                continue
+            ok, reason = is_safe_to_trash(it.path)   # safety floor, re-checked at execution
+            if not ok:
+                print(f"  skipped (protected): {_short_path(it.path)} — {reason}")
+                continue
+            try:
+                if _deletes_directly(it):
+                    with _status(con, f"Deleting {step}…"):
+                        remove_regenerable(it.path)
+                    print(f"  deleted: {_short_path(it.path)}")
+                else:
+                    with _status(con, f"Moving to the Trash {step}…"):
+                        trash(it.path)
+                    trashed += it.size
+                    print(f"  trashed: {_short_path(it.path)}")
+                done += 1
+            except Exception as e:
+                print(f"  FAILED: {_short_path(it.path)} — {e}")
+    except KeyboardInterrupt:
+        print(f"\nStopped after {done} of {len(queue)} item(s). Nothing else was changed.")
+        _invalidate_scan()
+        _report_freed(free_before, trashed, offer_empty=False)
+        return 130
+
+    _invalidate_scan()  # the disk changed; the next clean should scan again
+    _report_freed(free_before, trashed)
+    if result.dupes and result.dupes.reclaimable:
+        print(f"Also: {human(result.dupes.reclaimable)} of duplicate models can be reclaimed "
+              f"with `disksage dedupe` (nothing gets deleted).")
+    return 0
+
+
+def _ask(prompt: str) -> str:
+    try:
+        return input(prompt).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return "n"
+
+
+def _is_interactive() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _tui_available() -> bool:
+    if not _is_interactive():
+        return False
+    try:
+        import questionary  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
 
 def _choice_title(it, path_budget: int) -> str:
@@ -462,16 +1012,15 @@ def _choice_title(it, path_budget: int) -> str:
     size = human(it.size).rjust(9)
     ai = "🤖" if it.source == "ai" else "  "
     label = (it.label if len(it.label) <= 22 else it.label[:21] + "…").ljust(22)
-    return f"{size}  {ai} {label}  {_fit_path(it.path, path_budget)}"
+    return f"{size}  {ai} {label}  {_fit(_display_path(it), path_budget)}"
 
 
 def _select_tui(actionable):
     import questionary
     from questionary import Choice, Separator, Style
 
-    cols = shutil.get_terminal_size((100, 24)).columns
     # columns consumed before the path: pointer+checkbox (~6) + size/ai/label (~40)
-    path_budget = max(24, cols - 48)
+    path_budget = max(24, _columns() - 48)
 
     style = Style([
         ("qmark", "fg:#8b5cf6 bold"),
@@ -483,26 +1032,26 @@ def _select_tui(actionable):
         ("instruction", "fg:#9ca3af"),
     ])
 
-    ordered = sorted(actionable, key=lambda i: (TIER_ORDER.get(i.tier, 3), -i.size))
-    tier_totals: dict[str, int] = {}
-    for it in ordered:
-        tier_totals[it.tier] = tier_totals.get(it.tier, 0) + it.size
+    # Same sections, in the same order, as the summary.
+    stores = _model_stores()
+    sections: dict[str, list] = {key: [] for key in SECTION_HEADINGS}
+    for it in actionable:
+        sections[_bucket_of(it, stores)].append(it)
 
     choices = []
-    last_tier = None
-    for it in ordered:
-        if it.tier != last_tier:
-            if last_tier is not None:
-                choices.append(Separator(" "))
-            heading = _TIER_HEADINGS.get(it.tier, it.tier.upper())
-            choices.append(Separator(f"── {heading}  ·  {human(tier_totals[it.tier])} ──"))
-            last_tier = it.tier
-        choices.append(Choice(title=_choice_title(it, path_budget), value=it,
-                              checked=_default_checked(it)))
+    for key, heading in SECTION_HEADINGS.items():
+        group = sorted(sections[key], key=lambda i: -i.size)
+        if not group:
+            continue
+        if choices:
+            choices.append(Separator(" "))
+        choices.append(Separator(f"── {heading} · {human(sum(i.size for i in group))} ──"))
+        for it in group:
+            choices.append(Choice(title=_choice_title(it, path_budget), value=it,
+                                  checked=_default_checked(it)))
 
-    grand = human(sum(i.size for i in ordered))
     selected = questionary.checkbox(
-        f"Select what to move to Trash  ·  {len(ordered)} items, up to {grand} reclaimable:",
+        "Tick what to clean (the ticked items are the ones that cost you nothing to rebuild):",
         choices=choices,
         pointer="❯",
         instruction="(↑↓ move · space = tick · a = all · i = invert · enter = confirm)",
@@ -530,129 +1079,21 @@ def _select_prompts(actionable):
             queue.extend(dups)
     for it in rest:
         tag = it.tier.upper() + (" 🤖" if it.source == "ai" else "")
-        if _ask(f"{tag}  {human(it.size):>9}  {it.label}\n  {it.path}\n  Trash this? [y/N] ") == "y":
+        verb = "Run this?" if it.kind == "command" else "Trash this?"
+        if _ask(f"{tag}  {human(it.size):>9}  {it.label}\n  {_display_path(it)}\n"
+                f"  {verb} [y/N] ") == "y":
             queue.append(it)
     return queue
 
 
-def cmd_clean(args) -> int:
-    con = _console()
-    intro = ("disksage clean — you'll get a checklist to tick what to remove.\n"
-             "Nothing changes until you review the final list and type 'yes'. Caches that "
-             "rebuild themselves are deleted; everything else goes to the Trash (recoverable).")
-    con.print(f"[bold]{intro}[/bold]\n") if con else print(intro + "\n")
-
-    items = _scan_and_classify(args, con)
-    actionable = [i for i in items if i.tier in ("safe", "duplicate", "review")]
-
-    if not actionable:
-        print("Nothing reclaimable found.")
-        return 0
-
-    _print_report(items, con)
-    print(f"\nDisk: {_free_space()}")
-
-    if _tui_available():
-        queue = _select_tui(actionable)
-    else:
-        queue = _select_prompts(actionable)
-
-    if not queue:
-        print("\nNothing selected. Nothing deleted.")
-        return 0
-
-    # ---- Step 2: final review + one explicit confirmation before anything moves ----
-    deletes = [i for i in queue if _deletes_directly(i)]
-    trashes = [i for i in queue if not _deletes_directly(i)]
-    total = sum(i.size for i in queue)
-    print(f"\n{'─' * 60}")
-    print(f"About to clean {len(queue)} item(s) — {human(total)}:")
-    risky = 0
-    for heading, group in (
-            ("Delete (caches that rebuild themselves):", deletes),
-            ("Move to the Trash (you can get these back):", trashes)):
-        if not group:
-            continue
-        print(f"\n  {heading}")
-        for it in group:
-            _, tag = TIER_STYLE[it.tier]
-            line = f"    {tag} {human(it.size):>9}  {it.path}"
-            risk = git_risk(it.path) if it.kind != "duplicate" else None
-            if getattr(it, "tracked", 0):
-                tracked = f"{it.tracked} file(s) tracked by git: source, not build output"
-                risk = f"{risk}; {tracked}" if risk else tracked
-            if risk:
-                line += f"\n        ⚠️  {risk}"
-                risky += 1
-            print(line)
-    if risky:
-        print(f"\n  ⚠️  {risky} item(s) above carry a git warning — review them.")
-
-    if getattr(args, "dry_run", False):
-        print("\nDry run: nothing was deleted or moved.")
-        return 0
-
-    confirm = _ask(f"\nType 'yes' to clean these {len(queue)} item(s): ")
-    if confirm != "yes":
-        print("Aborted. Nothing was deleted.")
-        return 0
-
-    free_before = _free_bytes()
-    trashed = 0
-    for it in queue:
-        ok, reason = is_safe_to_trash(it.path)   # safety floor, re-checked at execution
-        if not ok:
-            print(f"  skipped (protected): {it.path} — {reason}")
-            continue
-        try:
-            if _deletes_directly(it):
-                remove_regenerable(it.path)
-                print(f"  deleted: {it.path}")
-            else:
-                trash(it.path)
-                trashed += it.size
-                print(f"  trashed: {it.path}")
-        except Exception as e:
-            print(f"  FAILED: {it.path} — {e}")
-
-    _offer_docker_prune()
-    _report_freed(free_before, trashed)
-    return 0
-
-
-def _free_bytes() -> int:
-    return shutil.disk_usage(HOME).free
-
-
-def _deletes_directly(it) -> bool:
-    """Caches that rebuild themselves (SAFE in the built-in list) are deleted
-    outright: in the Trash they'd free nothing until it's emptied. Anything
-    that could be yours (REVIEW, duplicates, AI-labelled items) goes to the
-    Trash instead."""
-    return it.tier == "safe" and it.source == "knowledge" and not getattr(it, "tracked", 0)
-
-
-def _offer_docker_prune() -> None:
-    """Docker's disk image is invisible to a file scan, so show Docker's own
-    report and offer Docker's own cleanup command."""
-    usage = tools.docker_usage()
-    if not usage:
-        return
-    print("\nDocker keeps images and containers inside its own disk image. Docker's report:")
-    print("\n".join(f"  {line}" for line in usage.splitlines()))
-    prune = tools.DOCKER_PRUNE
-    if _ask(f"Run `{prune.display}` to remove {prune.removes}? [y/N] ") == "y":
-        ok, last = tools.run(prune)
-        print(f"  {'done' if ok else 'failed'}{': ' + last if last else ''}")
-
-
-def _report_freed(free_before: int, trashed: int) -> None:
+def _report_freed(free_before: int, trashed: int, offer_empty: bool = True) -> None:
     """The only number worth trusting: how much free space actually changed."""
     gained = max(0, _free_bytes() - free_before)
-    print(f"\nDone. Free space went up by {human(gained)} (measured).")
+    print(f"\nFree space went up by {human(gained)} (measured).")
     if trashed:
-        print(f"{human(trashed)} is in the Trash and frees its space once the Trash is emptied.")
-        if sys.platform == "darwin" and _ask(
+        print(f"{human(trashed)} is in the Trash and frees its space once the Trash is emptied. "
+              f"To undo, open the Trash and drag items back.")
+        if offer_empty and sys.platform == "darwin" and _ask(
                 "Empty the Trash now? This also removes anything else already in it. [y/N] ") == "y":
             ok, err = empty_trash()
             if ok:
@@ -665,14 +1106,17 @@ def _report_freed(free_before: int, trashed: int) -> None:
 
 # ---- local models: inventory and clone-based dedupe ----
 
-def _duplicate_plan(min_size: int):
-    """Every model file, plus (keeper, copies-to-clone, reclaimable bytes) per
-    duplicate group. Copies disksage already turned into clones of the same
-    keeper don't count again."""
+def _duplicate_plan(min_size: int, con=None):
+    """Every model file, plus (keeper, copies, copies-to-clone, reclaimable
+    bytes) per duplicate group. Copies disksage already turned into clones of
+    the same keeper don't count again."""
     files = models.all_model_files(min_size)
     records = models.load_clones()
+    to_read = sum(f.size for f in models.files_to_hash(files))
+    with _bytes_progress(con, to_read, "Checking model files") as advance:
+        groups = models.find_model_duplicates(files, on_bytes=advance)
     plan = []
-    for group in models.find_model_duplicates(files):
+    for group in groups:
         keep = models.pick_keeper(group)
         copies = [f for f in group if f is not keep]
         todo = [f for f in copies if not models.already_shared(records, keep, f)]
@@ -685,16 +1129,14 @@ def _apps(files) -> str:
     return ", ".join(sorted({models.STORE_NAMES[f.store] for f in files}))
 
 
-def _model_name(f) -> str:
-    return f.names[0] if f.names else os.path.basename(f.path)
-
-
 def cmd_models(args) -> int:
-    files, plan, _ = _duplicate_plan(args.min_size * 1024 * 1024)
+    con = None if args.json else _console()
+    files, plan, _ = _duplicate_plan(args.min_size * MB, con)
     if args.json:
         print(json.dumps({
             "models": [{"app": f.store, "path": f.path, "bytes": f.size,
-                        "bytes_on_disk": f.on_disk, "sha256": f.sha256, "names": list(f.names)}
+                        "bytes_on_disk": f.on_disk, "sha256": f.sha256, "names": list(f.names),
+                        "file_name": f.file_name}
                        for f in files],
             "duplicates": [{"sha256": keep.sha256, "bytes": keep.size, "keep": keep.path,
                             "copies": [c.path for c in copies], "reclaimable_bytes": reclaim}
@@ -702,7 +1144,6 @@ def cmd_models(args) -> int:
         }, indent=2))
         return 0
 
-    con = _console()
     if not files:
         print("No local models found (looked in Ollama, LM Studio and the Hugging Face cache).")
         return 0
@@ -710,10 +1151,10 @@ def cmd_models(args) -> int:
     _say(con, f"[bold]{len(files)} model file(s), {human(total)} on disk[/bold]",
          f"{len(files)} model file(s), {human(total)} on disk")
     for f in files:
-        names = ", ".join(f.names) or "(not referenced by any model)"
-        print(f"  {human(f.on_disk):>9}  {models.STORE_NAMES[f.store]:<12}  {names}")
-        _say(con, f"             [dim]{_short_path(f.path)}[/dim]",
-             f"             {_short_path(f.path)}")
+        print(f"  {human(f.on_disk):>9}  {models.STORE_NAMES[f.store]:<12}  {f.title}")
+        if args.paths:
+            _say(con, f"             [dim]{_short_path(f.path)}[/dim]",
+                 f"             {_short_path(f.path)}")
 
     reclaimable = sum(p[3] for p in plan)
     if plan:
@@ -722,7 +1163,7 @@ def cmd_models(args) -> int:
         for keep, copies, todo, reclaim in plan:
             group = [keep, *copies]
             state = f"{human(reclaim)} reclaimable" if todo else "already shared (cloned)"
-            print(f"  {_model_name(keep)} · {human(keep.size)} × {len(group)} copies "
+            print(f"  {keep.title} · {human(keep.size)} × {len(group)} copies "
                   f"({_apps(group)}) · {state}")
     if reclaimable:
         _say(con, f"\n[bold]{human(reclaimable)} reclaimable.[/bold] Run `disksage dedupe` to "
@@ -730,24 +1171,31 @@ def cmd_models(args) -> int:
              f"\n{human(reclaimable)} reclaimable. Run `disksage dedupe` to store each file once.")
     print("\nTo remove a model for good: "
           + "; ".join(f"{models.STORE_NAMES[s]}: {h}" for s, h in models.REMOVE_HINTS.items()))
+    if not args.paths:
+        print("Add --paths to see where each file is.")
     return 0
 
 
 def cmd_dedupe(args) -> int:
     con = _console()
-    _, plan, records = _duplicate_plan(args.min_size * 1024 * 1024)
+    _, plan, records = _duplicate_plan(args.min_size * MB, con)
     todo = [(keep, f) for keep, _, copies, _ in plan for f in copies]
     if not todo:
         print("No duplicate models to reclaim.")
         return 0
     total = sum(f.on_disk for _, f in todo)
-    print(f"Replace {len(todo)} duplicate model file(s) with APFS clones — "
+    print(f"Replace {len(todo)} duplicate model file(s) with APFS clones: "
           f"up to {human(total)} reclaimable.")
     print("Every app keeps a working file at the same path; the bytes are stored once.\n")
     for keep, f in todo:
-        print(f"  {human(f.on_disk):>9}  {models.STORE_NAMES[f.store]:<12} {_short_path(f.path)}")
-        _say(con, f"             [dim]becomes a clone of {_short_path(keep.path)}[/dim]",
-             f"             becomes a clone of {_short_path(keep.path)}")
+        print(f"  {human(f.on_disk):>9}  {models.STORE_NAMES[f.store]:<12}  {f.title}")
+        _say(con, f"             [dim]becomes a clone of the {models.STORE_NAMES[keep.store]} "
+                  f"copy[/dim]",
+             f"             becomes a clone of the {models.STORE_NAMES[keep.store]} copy")
+        if args.paths:
+            _say(con, f"             [dim]{_short_path(f.path)}\n             → "
+                      f"{_short_path(keep.path)}[/dim]",
+                 f"             {_short_path(f.path)}\n             → {_short_path(keep.path)}")
 
     if getattr(args, "dry_run", False):
         print("\nDry run: nothing was changed.")
@@ -760,20 +1208,26 @@ def cmd_dedupe(args) -> int:
         return 0
 
     free_before = _free_bytes()
-    for keep, f in todo:
-        ok, reason = is_safe_to_trash(f.path)   # same safety floor as `clean`
-        if not ok:
-            print(f"  skipped (protected): {f.path} — {reason}")
-            continue
-        try:
-            if models.replace_with_clone(keep.path, f.path):
-                models.record_clone(records, keep.path, f.path)
-                print(f"  cloned: {_short_path(f.path)}")
-            else:
-                print(f"  skipped (not identical, or on another volume): {_short_path(f.path)}")
-        except Exception as e:
-            print(f"  FAILED: {f.path} — {e}")
+    lines = []
+    # Each pair is read in full (both files) to prove they're identical first.
+    with _bytes_progress(con, sum(2 * f.size for _, f in todo), "Verifying and cloning") as advance:
+        for keep, f in todo:
+            ok, reason = is_safe_to_trash(f.path)   # same safety floor as `clean`
+            if not ok:
+                lines.append(f"  skipped (protected): {_short_path(f.path)} — {reason}")
+                advance(2 * f.size)
+                continue
+            try:
+                if models.replace_with_clone(keep.path, f.path, on_bytes=advance):
+                    models.record_clone(records, keep.path, f.path)
+                    lines.append(f"  cloned: {f.title} ({models.STORE_NAMES[f.store]})")
+                else:
+                    lines.append(f"  skipped (not identical, or on another volume): {f.title}")
+            except Exception as e:
+                lines.append(f"  FAILED: {_short_path(f.path)} — {e}")
+    print("\n".join(lines))
     models.save_clones(records)
+    _invalidate_scan()
     gained = max(0, _free_bytes() - free_before)
     print(f"\nDone. Free space went up by {human(gained)} (measured).")
     print(f"Disk: {_free_space()}")
@@ -783,14 +1237,21 @@ def cmd_dedupe(args) -> int:
 def _scan_json(args) -> int:
     """`scan --json`: the same scan, as data for scripts and agents."""
     with contextlib.redirect_stdout(io.StringIO()):   # keep progress text out of the JSON
-        items = _scan_and_classify(args, None)
+        result = _scan(args, None)
+    buckets, _ = _buckets(result)
     print(json.dumps({
         "version": __version__,
         "free_bytes": _free_bytes(),
+        "files_seen": result.files_seen,
+        "seconds": round(result.seconds, 2),
+        "summary": [{"group": b.key, "bytes": b.size, "effect": b.effect, "what": b.what,
+                     "estimate": b.approx}
+                    for b in buckets],
         "items": [{"path": i.path, "tier": i.tier, "label": i.label, "why": i.why,
                    "source": i.source, "kind": i.kind, "bytes_on_disk": i.size,
-                   "pre_ticked": _default_checked(i), "git_tracked_files": i.tracked}
-                  for i in sorted(items, key=lambda i: -i.size)],
+                   "pre_ticked": _default_checked(i), "git_tracked_files": i.tracked,
+                   **({"original": i.original} if i.original else {})}
+                  for i in sorted(result.items, key=lambda i: -i.size)],
     }, indent=2))
     return 0
 
@@ -802,14 +1263,13 @@ def main(argv=None) -> int:
         description="AI-aware disk cleaner that never deletes without asking.",
         epilog=(
             "examples:\n"
-            "  disksage              scan and report (deletes nothing)\n"
-            "  disksage scan         same as above\n"
-            "  disksage clean        pick items from a checklist and free space\n"
+            "  disksage              scan, see what can be freed, then choose what to clean\n"
+            "  disksage scan         read-only report (--details for every item)\n"
+            "  disksage clean        choose what to clean from a checklist\n"
             "  disksage clean --dry-run   show what clean would do, change nothing\n"
             "  disksage models       every local model, and the ones stored twice\n"
             "  disksage dedupe       reclaim duplicate models as APFS clones\n"
             "  disksage setup        choose an AI provider / paste a key\n"
-            "  disksage clean --min-size 5 --no-ai\n"
         ))
     p.add_argument("--version", action="version", version=f"disksage {__version__}")
     sub = p.add_subparsers(dest="cmd", metavar="{scan,clean,models,dedupe,setup,doctor}")
@@ -821,9 +1281,11 @@ def main(argv=None) -> int:
                                        "and find the ones stored more than once")
     mp.add_argument("--min-size", type=int, default=50, help="MB threshold (default 50)")
     mp.add_argument("--json", action="store_true", help="print the result as JSON")
+    mp.add_argument("--paths", action="store_true", help="show where each file is")
     dp = sub.add_parser("dedupe", help="replace duplicate model files with APFS clones")
     dp.add_argument("--min-size", type=int, default=50, help="MB threshold (default 50)")
     dp.add_argument("--dry-run", action="store_true", help="show the plan, change nothing")
+    dp.add_argument("--paths", action="store_true", help="show the paths of both copies")
 
     for name in ("scan", "clean"):
         sp = sub.add_parser(name)
@@ -843,13 +1305,25 @@ def main(argv=None) -> int:
         if name == "clean":
             sp.add_argument("--dry-run", action="store_true",
                             help="show what would be deleted or trashed, change nothing")
+            sp.add_argument("--rescan", action="store_true",
+                            help="scan again instead of reusing a scan from the last "
+                                 f"{SCAN_REUSE_SECONDS // 60} minutes")
         else:
+            sp.add_argument("--details", action="store_true",
+                            help="list every item, not just the biggest")
             sp.add_argument("--json", action="store_true",
                             help="print the result as JSON (for scripts and agents)")
 
     args = p.parse_args(argv)
     config.load()
+    try:
+        return _run(p, args)
+    except KeyboardInterrupt:
+        print("\nStopped. Nothing else was changed.")
+        return 130
 
+
+def _run(p, args) -> int:
     if args.cmd == "setup":
         return cmd_setup(args)
     if args.cmd == "doctor":
@@ -862,12 +1336,16 @@ def main(argv=None) -> int:
     if getattr(args, "provider", None):
         os.environ["DISKSAGE_PROVIDER"] = args.provider
 
-    # No subcommand → behave like `scan`.
-    if not hasattr(args, "min_size"):
+    # No subcommand: in a terminal, the whole flow (scan → summary → clean);
+    # when piped, the read-only report.
+    bare = args.cmd is None
+    if bare:
         args = p.parse_args(["scan"])
+        if _is_interactive():
+            return cmd_home(args)
 
     # No setup questions before the first result: the built-in list works on its
-    # own, and the scan says when an AI could identify more.
+    # own, and the summary says when an AI could identify more.
     if args.cmd == "clean":
         return cmd_clean(args)
     if getattr(args, "json", False):

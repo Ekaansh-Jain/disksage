@@ -20,14 +20,36 @@ Or run it once without installing anything: `uvx disksage`. To install the lates
 
 ## Use
 
+Run `disksage`. It scans, shows what you can free grouped by what it costs you, and asks whether to clean now:
+
+```text
+Free up to ≈1.7 GB on this Mac · 13.5 GB free now
+
+    430.0 MB  nothing lost           3 caches that rebuild themselves
+   ≈600.0 MB  nothing deleted        1 model stored by more than one app · disksage dedupe
+    400.0 MB  rebuild if needed      2 folders in 2 projects untouched for 30+ days
+    300.0 MB  re-download if needed  the local models themselves · disksage models
+
+Biggest items
+    300.0 MB  Ollama models             ~/.ollama/models
+    260.0 MB  Python virtualenv         ~/Projects/ml-experiments/.venv · 9 months ago
+    140.0 MB  Node modules              ~/Projects/old-react-app/node_modules · 9 months ago
+    …
+
+Review and clean now? [Y/n]
+```
+
+Press Enter for a checklist with the same groups. Only the things that cost you nothing to rebuild start ticked, and nothing changes until you type `yes`.
+
 ```bash
-disksage            # read-only report, deletes nothing
-disksage clean      # tick what to remove: caches are deleted, your files go to the Trash
-disksage models     # every local model, where it lives, and which ones are stored twice
+disksage            # scan, see what can be freed, then choose what to clean
+disksage scan       # the same report without cleaning (--details lists every item)
+disksage clean      # straight to the checklist; reuses a scan from the last 10 minutes
+disksage models     # every local model, and which ones are stored by more than one app
 disksage dedupe     # store duplicate models once, as APFS clones; every app keeps its file
 ```
 
-Add `--dry-run` to see what `clean` or `dedupe` would do without changing anything, and `--json` to `scan` or `models` for scripts and agents.
+Add `--dry-run` to see what `clean` or `dedupe` would do without changing anything, `--rescan` to make `clean` scan again, and `--json` to `scan` or `models` for scripts and agents.
 
 ## What's different about it
 
@@ -35,7 +57,7 @@ Add `--dry-run` to see what `clean` or `dedupe` would do without changing anythi
 - **Numbers you can trust.** Sizes are bytes on disk. Hard links are counted once, sparse files count only what they use, and iCloud placeholders are skipped (they free nothing, and reading them would download them). After `clean` or `dedupe`, the last line is the measured change in free space.
 - **It explains what it finds.** A built-in list covers known caches. Anything else can go to an optional AI (a cloud provider, or a local model through Ollama or LM Studio) that sees only paths and sizes. The AI can explain an item but can never mark it safe to delete.
 - **A safety floor the AI can't override.** Only your home folder. Never keychains, app containers, Mail, Messages, Photos and other libraries, iCloud Drive, cloud-sync folders, iPhone backups, credentials, or anything inside a macOS package. Folders with git-tracked files or unpushed commits are flagged and never pre-ticked.
-- **Your tools' own cleanup commands.** `disksage scan` shows Docker's own space report (its disk image is invisible to a file scan) and lists commands like `brew cleanup`, `uv cache prune`, `hf cache prune` and `xcrun simctl delete unavailable` that free space while keeping what you still use. `disksage clean` offers to run `docker system prune` after asking.
+- **Your tools' own cleanup commands.** Docker's disk image is invisible to a file scan, so disksage asks Docker for its own numbers and puts `docker system prune` in the checklist (unticked). It also lists commands like `brew cleanup`, `uv cache prune`, `hf cache prune` and `xcrun simctl delete unavailable` that free space while keeping what you still use.
 
 ## How it decides
 

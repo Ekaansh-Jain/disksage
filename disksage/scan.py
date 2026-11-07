@@ -7,15 +7,38 @@ We don't scan the whole disk blindly. We look where space actually hides:
   - a handful of known heavy singletons.
 
 Only items at or above `min_size` are returned, so the report stays readable.
+
+A ScanProgress object counts files and bytes as we go (for the live display)
+and lets the caller stop the walk (Ctrl+C).
+
+Folders are sized one at a time by default. Measured on a warm disk cache,
+threads made sizing 3-4x *slower*: the per-file work is Python code, and
+Python runs it on one core however many threads wait for it. On a cold cache
+(the first scan after a restart) the disk may be the bottleneck instead, and
+threads could help there; set DISKSAGE_SCAN_WORKERS=4 to measure it.
 """
 
 from __future__ import annotations
 
 import os
 import stat
-from dataclasses import dataclass
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 
 HOME = os.path.expanduser("~")
+
+
+def _workers_from_env() -> int:
+    try:
+        return max(1, min(32, int(os.environ.get("DISKSAGE_SCAN_WORKERS", "1"))))
+    except ValueError:
+        return 1
+
+
+# How many folders to size at once (see the module docstring).
+SCAN_WORKERS = _workers_from_env()
 
 # macOS <sys/stat.h>: the file's contents live in iCloud / a File Provider, not on
 # this disk. Python 3.13+ exposes it as stat.SF_DATALESS.
@@ -96,6 +119,7 @@ PACKAGE_SUFFIXES = (
 def is_package(name_or_path: str) -> bool:
     return name_or_path.rstrip(os.sep).lower().endswith(PACKAGE_SUFFIXES)
 
+
 MAX_WALK_DEPTH = 6  # don't spelunk forever inside project roots
 
 # Reclaimable sub-folders that hide INSIDE otherwise-keep app folders
@@ -126,6 +150,42 @@ class Item:
     # filled in by the CLI for project folders
     tracked: int = 0           # files under this path that git tracks (source, not output)
     touched: float = 0.0       # when the project around it was last worked on (Unix time)
+    # duplicates only: the identical copy that stays
+    original: str = ""
+
+
+class ScanProgress:
+    """Counts files looked at and bytes counted while a scan runs, for the live
+    display, and lets the caller stop all workers at once.
+
+    Workers count locally and add their totals every FLUSH files, so keeping
+    count costs almost nothing even across millions of files."""
+
+    FLUSH = 2000
+
+    def __init__(self) -> None:
+        self.files = 0
+        self.bytes = 0
+        self.started = time.monotonic()
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+
+    def add(self, files: int, nbytes: int) -> None:
+        if files or nbytes:
+            with self._lock:
+                self.files += files
+                self.bytes += nbytes
+
+    def cancel(self) -> None:
+        self._stop.set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._stop.is_set()
+
+    @property
+    def seconds(self) -> float:
+        return time.monotonic() - self.started
 
 
 def size_on_disk(st: os.stat_result) -> int:
@@ -145,27 +205,37 @@ def is_dataless(st: os.stat_result) -> bool:
     return bool(getattr(st, "st_flags", 0) & SF_DATALESS)
 
 
+# Several folders are sized at once, and a hard-linked file can appear in two
+# of them; this lock keeps "have we counted this inode yet?" exact.
+_seen_lock = threading.Lock()
+
+
 def _count_once(st: os.stat_result, seen: set[tuple[int, int]]) -> int:
     """Bytes on disk for one file, counting a hard-linked file only the first
     time we meet it (the same bytes can have several names)."""
     if st.st_nlink > 1:
         key = (st.st_dev, st.st_ino)
-        if key in seen:
-            return 0
-        seen.add(key)
+        with _seen_lock:
+            if key in seen:
+                return 0
+            seen.add(key)
     return size_on_disk(st)
 
 
 def dir_size(path: str, stop: set[str] | None = None,
-             seen: set[tuple[int, int]] | None = None) -> int:
+             seen: set[tuple[int, int]] | None = None,
+             progress: ScanProgress | None = None) -> int:
     """Bytes on disk under path, not following symlinks.
 
     `stop` is a set of paths NOT to descend into — used so a parent folder
     doesn't double-count bytes that belong to a separately-listed child
-    (e.g. Application Support/Claude excludes its own vm_bundles).
+    (e.g. Application Support/Claude excludes its own vm_bundles). `path`
+    itself may be in it.
 
     `seen` is shared across one whole scan so a hard-linked file is only
-    counted for the first candidate that contains it."""
+    counted for the first candidate that reaches it.
+
+    `progress` gets running counts, and stops the walk early if cancelled."""
     stop = stop or set()
     seen = set() if seen is None else seen
     try:
@@ -175,10 +245,16 @@ def dir_size(path: str, stop: set[str] | None = None,
     if stat.S_ISLNK(st.st_mode):
         return 0
     if not stat.S_ISDIR(st.st_mode):
-        return _count_once(st, seen)
+        size = _count_once(st, seen)
+        if progress:
+            progress.add(1, size)
+        return size
     total = 0
+    pending_files = pending_bytes = 0
     stack = [path]
     while stack:
+        if progress and progress.cancelled:
+            break
         d = stack.pop()
         try:
             with os.scandir(d) as it:
@@ -191,11 +267,19 @@ def dir_size(path: str, stop: set[str] | None = None,
                                 continue  # belongs to a deeper candidate
                             stack.append(entry.path)
                         else:
-                            total += _count_once(entry.stat(follow_symlinks=False), seen)
+                            size = _count_once(entry.stat(follow_symlinks=False), seen)
+                            total += size
+                            pending_files += 1
+                            pending_bytes += size
+                            if progress and pending_files >= ScanProgress.FLUSH:
+                                progress.add(pending_files, pending_bytes)
+                                pending_files = pending_bytes = 0
                     except OSError:
                         continue
         except OSError:
             continue
+    if progress:
+        progress.add(pending_files, pending_bytes)
     return total
 
 
@@ -241,46 +325,152 @@ def project_last_touched(cruft_dir: str) -> float:
     return max(times)
 
 
-def _walk_for_cruft(root: str, found: list[str]) -> None:
+@dataclass(frozen=True)
+class FileInfo:
+    path: str
+    size: int      # length in bytes: identical files have equal lengths, so group duplicates by this
+    on_disk: int   # bytes allocated: what deleting the file frees; show and total this
+
+
+@dataclass
+class ProjectWalk:
+    """What one pass over the project folders found."""
+    cruft: list[str] = field(default_factory=list)       # node_modules, .venv, build, …
+    files: list[FileInfo] = field(default_factory=list)  # big loose files, if asked for
+    cloud_only_files: int = 0
+    cloud_only_bytes: int = 0
+
+
+def _map(fn, items: list, progress: ScanProgress | None = None) -> list:
+    """`[fn(x) for x in items]`, on SCAN_WORKERS threads when that's more than
+    one. Ctrl+C cancels the other workers instead of waiting for them."""
+    if SCAN_WORKERS <= 1 or len(items) < 2:
+        return [fn(x) for x in items]
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+        try:
+            return list(pool.map(fn, items))
+        except BaseException:
+            if progress:
+                progress.cancel()
+            raise
+
+
+def _walk_project_root(root: str, file_min: int | None, seen: set[tuple[int, int]],
+                       progress: ScanProgress | None) -> ProjectWalk:
+    found = ProjectWalk()
     base_depth = root.rstrip(os.sep).count(os.sep)
-    for dirpath, dirnames, _ in os.walk(root):
+    pending = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        if progress and progress.cancelled:
+            break
         if dirpath.count(os.sep) - base_depth >= MAX_WALK_DEPTH:
             dirnames[:] = []
             continue
-        pruned = []
-        for name in list(dirnames):
-            full = os.path.join(dirpath, name)
-            if is_package(name):
-                pruned.append(name)  # an app's data, never ours to judge
-            elif name in CRUFT_DIR_NAMES:
-                found.append(full)
-                pruned.append(name)  # don't descend into a matched dir
-        for name in pruned:
-            dirnames.remove(name)
+        descend = []
+        for name in dirnames:
+            if is_package(name) or name == ".git":
+                continue  # an app's data, or git's internals: never ours to judge
+            if name in CRUFT_DIR_NAMES:
+                found.cruft.append(os.path.join(dirpath, name))
+                continue  # listed (and sized) as a folder of its own
+            descend.append(name)
+        dirnames[:] = descend
+        if file_min is None:
+            continue
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue
+            pending += 1
+            if progress and pending >= ScanProgress.FLUSH:
+                progress.add(pending, 0)
+                pending = 0
+            if not stat.S_ISREG(st.st_mode) or st.st_size < file_min:
+                continue  # symlinks, sockets, small files
+            if is_dataless(st):
+                found.cloud_only_files += 1
+                found.cloud_only_bytes += st.st_size
+                continue
+            key = (st.st_dev, st.st_ino)
+            with _seen_lock:
+                if key in seen:
+                    continue  # another name for a file we already have
+                seen.add(key)
+            found.files.append(FileInfo(path, st.st_size, size_on_disk(st)))
+    if progress:
+        progress.add(pending, 0)
+    return found
 
 
-def _drill_for_buried(root: str, found: list[str]) -> None:
-    base_depth = root.rstrip(os.sep).count(os.sep)
-    for dirpath, dirnames, _ in os.walk(root):
+def walk_projects(roots: list[str], file_min: int | None = None,
+                  progress: ScanProgress | None = None) -> ProjectWalk:
+    """One pass over the project folders that finds both the cruft folders
+    (without descending into them) and, when `file_min` is given, the big loose
+    files. Each root is walked in its own thread.
+
+    Never returns the same bytes twice: symlinks are skipped, and only the first
+    name of a hard-linked file is kept, so a file can't be offered as a
+    "duplicate" of itself. Cloud placeholders are skipped and counted (they free
+    nothing, and reading them downloads them)."""
+    roots = [r for r in _once_each(roots, follow_symlinks=True) if os.path.isdir(r)]
+    seen: set[tuple[int, int]] = set()
+    parts = _map(lambda r: _walk_project_root(r, file_min, seen, progress), roots, progress)
+    out = ProjectWalk()
+    for part in parts:
+        out.cruft.extend(part.cruft)
+        out.files.extend(part.files)
+        out.cloud_only_files += part.cloud_only_files
+        out.cloud_only_bytes += part.cloud_only_bytes
+    return out
+
+
+def _drill_one(top: str, base_depth: int) -> list[str]:
+    """Buried caches inside one app's folder in Application Support."""
+    name = os.path.basename(top)
+    if is_package(name):
+        return []
+    if name in BURIED_CACHE_NAMES:
+        return [top]
+    found = []
+    for dirpath, dirnames, _ in os.walk(top):
         if dirpath.count(os.sep) - base_depth >= DRILL_DEPTH:
             dirnames[:] = []
             continue
-        for name in list(dirnames):
-            if is_package(name):
-                dirnames.remove(name)
-            elif name in BURIED_CACHE_NAMES:
-                found.append(os.path.join(dirpath, name))
-                dirnames.remove(name)  # don't descend further into it
+        for d in list(dirnames):
+            if is_package(d):
+                dirnames.remove(d)
+            elif d in BURIED_CACHE_NAMES:
+                found.append(os.path.join(dirpath, d))
+                dirnames.remove(d)  # don't descend further into it
+    return found
 
 
-def collect_candidates(root: str | None = None) -> list[str]:
-    # Custom-root mode: scan just this folder for cruft dirs (node_modules,
-    # .venv, build, …). Big loose files and duplicates inside it are surfaced
+def _drill_for_buried() -> list[str]:
+    tops: list[tuple[str, int]] = []
+    for root in DRILL_ROOTS:
+        try:
+            names = os.listdir(root)
+        except OSError:
+            continue
+        depth = root.rstrip(os.sep).count(os.sep)
+        tops.extend((os.path.join(root, n), depth) for n in names
+                    if os.path.isdir(os.path.join(root, n)))
+    return [p for part in _map(lambda t: _drill_one(*t), tops) for p in part]
+
+
+def collect_candidates(root: str | None = None, cruft: list[str] | None = None) -> list[str]:
+    """Every folder worth sizing. Pass `cruft` from an earlier walk_projects()
+    call to avoid walking the project folders a second time."""
+    if cruft is None:
+        cruft = walk_projects([root] if root else PROJECT_ROOTS).cruft
+
+    # Custom-root mode: just this folder's cruft dirs (node_modules, .venv,
+    # build, …). Big loose files and duplicates inside it are surfaced
     # separately by the file scan, so we deliberately do NOT list every
     # subfolder as a blob — that would double-count the files within them.
     if root:
-        cruft: list[str] = []
-        _walk_for_cruft(root, cruft)
         return _once_each(sorted(set(cruft)), follow_symlinks=False)
 
     paths: set[str] = set()
@@ -302,17 +492,8 @@ def collect_candidates(root: str | None = None) -> list[str]:
             except OSError:
                 pass
 
-    cruft: list[str] = []
-    for root in _once_each(PROJECT_ROOTS, follow_symlinks=True):
-        if os.path.isdir(root):
-            _walk_for_cruft(root, cruft)
     paths.update(cruft)
-
-    buried: list[str] = []
-    for root in DRILL_ROOTS:
-        if os.path.isdir(root):
-            _drill_for_buried(root, buried)
-    paths.update(buried)
+    paths.update(_drill_for_buried())
 
     for s in SINGLETONS:
         if os.path.exists(s):
@@ -321,78 +502,39 @@ def collect_candidates(root: str | None = None) -> list[str]:
     return _once_each(sorted(paths), follow_symlinks=False)
 
 
-def scan_dirs(min_size: int = 20 * 1024 * 1024, root: str | None = None) -> list[Item]:
+def scan_dirs(min_size: int = 20 * 1024 * 1024, root: str | None = None,
+              cruft: list[str] | None = None,
+              progress: ScanProgress | None = None) -> list[Item]:
     """Return directory candidates >= min_size, largest first.
 
     Sizes are NON-OVERLAPPING: when one candidate lives inside another, the
     parent's size excludes the child, so the same bytes are never counted
     twice and every folder shows its own reclaimable weight. Sizes are bytes
     on disk, and a hard-linked file counts once across the whole scan."""
-    candidates = collect_candidates(root)
-    cand_set = set(candidates)
+    candidates = collect_candidates(root, cruft=cruft)
+    stop = set(candidates)  # no folder descends into another candidate
     seen: set[tuple[int, int]] = set()
 
-    items: list[Item] = []
-    for path in candidates:
-        others = cand_set - {path}
-        size = dir_size(path, stop=others, seen=seen)
-        if size >= min_size:
-            items.append(Item(path=path, size=size, kind="dir"))
+    sizes = _map(lambda p: dir_size(p, stop=stop, seen=seen, progress=progress),
+                 candidates, progress)
+
+    items = [Item(path=p, size=s, kind="dir")
+             for p, s in zip(candidates, sizes, strict=True) if s >= min_size]
     items.sort(key=lambda i: i.size, reverse=True)
     return items
-
-
-@dataclass(frozen=True)
-class FileInfo:
-    path: str
-    size: int      # length in bytes: identical files have equal lengths, so group duplicates by this
-    on_disk: int   # bytes allocated: what deleting the file frees; show and total this
 
 
 def collect_files(file_min: int, roots: list[str] | None = None,
                   stats: dict | None = None) -> list[FileInfo]:
     """All regular files >= file_min bytes inside the given roots (default:
     project roots), skipping cruft/.git dirs (already accounted for as
-    directories).
-
-    Never returns the same bytes twice: symlinks are skipped, and only the first
-    name of a hard-linked file is kept, so a file can't be offered as a
-    "duplicate" of itself. Cloud placeholders are skipped (they free nothing and
-    reading them downloads them); pass a `stats` dict to get how many."""
-    out: list[FileInfo] = []
-    seen: set[tuple[int, int]] = set()
+    directories). See walk_projects(); pass a `stats` dict to get how many
+    cloud-only files were skipped."""
+    walk = walk_projects(roots if roots is not None else PROJECT_ROOTS, file_min=file_min)
     if stats is not None:
-        stats.setdefault("cloud_only_files", 0)
-        stats.setdefault("cloud_only_bytes", 0)
-    for root in _once_each(roots if roots is not None else PROJECT_ROOTS, follow_symlinks=True):
-        if not os.path.isdir(root):
-            continue
-        base_depth = root.rstrip(os.sep).count(os.sep)
-        for dirpath, dirnames, filenames in os.walk(root):
-            if dirpath.count(os.sep) - base_depth >= MAX_WALK_DEPTH:
-                dirnames[:] = []
-                continue
-            dirnames[:] = [d for d in dirnames
-                           if d not in FILE_WALK_SKIP and not is_package(d)]
-            for name in filenames:
-                fp = os.path.join(dirpath, name)
-                try:
-                    st = os.lstat(fp)
-                except OSError:
-                    continue
-                if not stat.S_ISREG(st.st_mode) or st.st_size < file_min:
-                    continue  # symlinks, sockets, small files
-                if is_dataless(st):
-                    if stats is not None:
-                        stats["cloud_only_files"] += 1
-                        stats["cloud_only_bytes"] += st.st_size
-                    continue
-                key = (st.st_dev, st.st_ino)
-                if key in seen:
-                    continue  # another name for a file we already have
-                seen.add(key)
-                out.append(FileInfo(fp, st.st_size, size_on_disk(st)))
-    return out
+        stats["cloud_only_files"] = stats.get("cloud_only_files", 0) + walk.cloud_only_files
+        stats["cloud_only_bytes"] = stats.get("cloud_only_bytes", 0) + walk.cloud_only_bytes
+    return walk.files
 
 
 # Backwards-compatible alias.

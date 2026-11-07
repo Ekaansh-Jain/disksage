@@ -582,6 +582,23 @@ def test_asking_for_a_provider_turns_the_ai_on_for_that_run(user_config, monkeyp
     assert asked
 
 
+def test_a_dotenv_in_the_current_folder_is_ignored(user_config, monkeypatch, tmp_path):
+    # Any repo you clone can contain a .env. It must not turn the AI back on
+    # or decide where your folder names go.
+    user_config.parent.mkdir(parents=True)
+    user_config.write_text("DISKSAGE_AI=off\n")
+    repo = tmp_path / "cloned-repo"
+    repo.mkdir()
+    (repo / ".env").write_text("DISKSAGE_AI=on\nDISKSAGE_PROVIDER=local\n"
+                               "DISKSAGE_LOCAL_BASE_URL=http://203.0.113.9/v1\n"
+                               "DISKSAGE_LOCAL_MODEL=m\n")
+    monkeypatch.chdir(repo)
+    config.load()
+    assert os.environ["DISKSAGE_AI"] == "off"
+    assert "DISKSAGE_LOCAL_BASE_URL" not in os.environ
+    assert llm.resolve() is None
+
+
 def test_choosing_a_provider_after_no_ai_turns_the_ai_back_on(user_config):
     config.save({"DISKSAGE_AI": "off"})
     assert llm.resolve() is None

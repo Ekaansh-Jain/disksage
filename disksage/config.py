@@ -1,8 +1,9 @@
 """User configuration — where a person's AI choice + keys are stored.
 
 Kept in ~/.config/disksage/.env (chmod 600) so it persists across runs and
-isn't tied to the current directory. A local ./.env still wins if present, so
-developers can override without touching their real config.
+isn't tied to the current directory. Variables already set in the shell win
+over the file. A .env in the current folder is never read: any repo you
+clone can contain one, and it must not decide where your folder names go.
 
 Keys the user pastes during `disksage setup` are written here and never printed
 back. Nothing is ever sent anywhere except the AI provider they chose.
@@ -17,14 +18,13 @@ ENV_PATH = os.path.join(CONFIG_DIR, ".env")
 
 
 def load() -> None:
-    """Load the user config, then let a local ./.env override it."""
+    """Load the user config. Variables already set in the shell win."""
     try:
         from dotenv import load_dotenv
     except ImportError:
         return
     if os.path.exists(ENV_PATH):
         load_dotenv(ENV_PATH)
-    load_dotenv(".env", override=True)
 
 
 def is_configured() -> bool:

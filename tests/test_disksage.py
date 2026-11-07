@@ -10,15 +10,17 @@ else runs the tool on their own machine:
 Run:  ./.venv/bin/python -m pytest -q
 """
 
+import hashlib
 import json
 import os
+import sys
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from disksage import cli, dedup, knowledge, llm, safety
+from disksage import cli, dedup, knowledge, llm, models, safety
 from disksage.classify import build_file_items
 from disksage.scan import collect_files, dir_size, is_dataless, scan_dirs, size_on_disk
 
@@ -569,3 +571,124 @@ def test_scan_shows_results_and_suggests_setup_instead_of_asking(monkeypatch, ca
     out = " ".join(capsys.readouterr().out.split())   # rich wraps long lines
     assert "MysteryApp" in out
     assert "disksage setup" in out
+
+
+# ---- local models: the same file stored by several apps ----
+
+@pytest.fixture
+def model_stores(monkeypatch, tmp_path):
+    """The same 3 MB "model" downloaded by Ollama, Hugging Face and LM Studio,
+    in a home folder of its own."""
+    for var in ("HF_HOME", "HF_HUB_CACHE", "OLLAMA_MODELS"):
+        monkeypatch.delenv(var, raising=False)
+    home = str(tmp_path)
+    monkeypatch.setattr(models, "HOME", home)
+    monkeypatch.setattr(models, "STATE_DIR", os.path.join(home, ".local/state/disksage"))
+    monkeypatch.setattr(models, "CLONES_FILE", os.path.join(home, ".local/state/disksage/clones.json"))
+    dirs = models.model_dirs(home)
+    monkeypatch.setattr(models, "model_dirs", lambda home=None: dirs)
+
+    weights = os.urandom(3 * MB)
+    digest = hashlib.sha256(weights).hexdigest()
+    _make(os.path.join(dirs["ollama"], "blobs", f"sha256-{digest}"), weights)
+    manifest = {"layers": [{"mediaType": "application/vnd.ollama.image.model",
+                            "digest": f"sha256:{digest}", "size": len(weights)}]}
+    _make(os.path.join(dirs["ollama"], "manifests", "registry.ollama.ai", "library",
+                       "llama3.2", "latest"), json.dumps(manifest).encode())
+    # Newer huggingface_hub: the repo's blob is a symlink into a shared store.
+    repo = os.path.join(dirs["huggingface"], "models--bartowski--Llama-3.2-3B-Instruct-GGUF")
+    shared = _make(os.path.join(dirs["huggingface"], "blobs", "ab", "xethash"), weights)
+    os.makedirs(os.path.join(repo, "blobs"))
+    os.symlink(shared, os.path.join(repo, "blobs", digest))
+    _make(os.path.join(repo, "blobs", "a" * 40), b"small git file")
+    lms = _make(os.path.join(dirs["lmstudio"], "bartowski", "Llama-3.2-3B-Instruct-GGUF",
+                             "Llama-3.2-3B-Instruct-Q4_K_M.gguf"), weights)
+    _make(os.path.join(dirs["lmstudio"], "other", "different.gguf"), os.urandom(4 * MB))
+    return {"digest": digest, "shared": shared, "lmstudio": lms, "dirs": dirs}
+
+
+def test_the_same_model_is_found_in_all_three_apps(model_stores):
+    files = models.all_model_files(min_size=MB)
+    groups = models.find_model_duplicates(files)
+    assert len(groups) == 1
+    group = groups[0]
+    assert {f.store for f in group} == {"ollama", "huggingface", "lmstudio"}
+    assert all(f.sha256 == model_stores["digest"] for f in group)
+    assert models.pick_keeper(group).path == os.path.realpath(model_stores["shared"])
+    ollama = [f for f in group if f.store == "ollama"][0]
+    assert ollama.names == ("llama3.2:latest",)
+    unrelated = [f for f in files if f.path.endswith("different.gguf")][0]
+    assert unrelated.sha256 is None          # unique size: never read
+
+
+def test_hard_linked_copies_are_not_duplicates(tmp_path):
+    a = _make(str(tmp_path / "a.gguf"), os.urandom(MB))
+    os.link(a, tmp_path / "b.gguf")
+    files = [models.ModelFile("lmstudio", str(tmp_path / n), MB, None) for n in ("a.gguf", "b.gguf")]
+    assert models.find_model_duplicates(files) == []
+
+
+def test_models_json_reports_what_dedupe_would_reclaim(model_stores, capsys):
+    assert cli.main(["models", "--json", "--min-size", "1"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert len(data["models"]) == 4
+    [dup] = data["duplicates"]
+    assert dup["keep"] == os.path.realpath(model_stores["shared"])
+    assert len(dup["copies"]) == 2 and dup["reclaimable_bytes"] >= 6 * MB
+
+
+def test_dedupe_dry_run_changes_nothing(model_stores, capsys):
+    before = os.stat(model_stores["lmstudio"]).st_ino
+    assert cli.main(["dedupe", "--dry-run", "--min-size", "1"]) == 0
+    assert "Dry run" in capsys.readouterr().out
+    assert os.stat(model_stores["lmstudio"]).st_ino == before
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="macOS really clones; tested below")
+def test_dedupe_refuses_without_apfs(model_stores, monkeypatch, capsys):
+    monkeypatch.setattr("builtins.input", lambda *a: pytest.fail("must not ask off macOS"))
+    before = os.stat(model_stores["lmstudio"]).st_ino
+    assert cli.main(["dedupe", "--min-size", "1"]) == 1
+    assert "needs macOS" in capsys.readouterr().out
+    assert os.stat(model_stores["lmstudio"]).st_ino == before
+
+
+def test_clone_records_follow_the_files(tmp_path):
+    keep = _make(str(tmp_path / "keep.gguf"), b"k" * 100)
+    copy = _make(str(tmp_path / "copy.gguf"), b"k" * 100)
+    records: dict = {}
+    models.record_clone(records, keep, copy)
+    mk = models.ModelFile("huggingface", keep, 100, None)
+    mc = models.ModelFile("lmstudio", copy, 100, None)
+    assert models.already_shared(records, mk, mc)
+    # The app re-downloads the file: new inode, so it's a full duplicate again.
+    os.remove(copy)
+    _make(copy, b"k" * 100)
+    assert not models.already_shared(records, mk, mc)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="needs macOS and APFS")
+def test_dedupe_clones_and_every_app_keeps_its_file(model_stores, monkeypatch, capsys):
+    monkeypatch.setattr("builtins.input", lambda *a: "yes")
+    with open(model_stores["lmstudio"], "rb") as f:
+        data = f.read()
+    before = os.stat(model_stores["lmstudio"]).st_ino
+    assert cli.main(["dedupe", "--min-size", "1"]) == 0
+    assert "cloned:" in capsys.readouterr().out
+    with open(model_stores["lmstudio"], "rb") as f:
+        assert f.read() == data                       # same bytes at the same path
+    assert os.stat(model_stores["lmstudio"]).st_ino != before
+    assert cli.main(["models", "--json", "--min-size", "1"]) == 0
+    [dup] = json.loads(capsys.readouterr().out)["duplicates"]
+    assert dup["reclaimable_bytes"] == 0              # remembered as already shared
+
+
+def test_scan_json_is_valid_and_quiet(monkeypatch, capsys):
+    from disksage import tools
+    _make(os.path.join(HOME, "Library/Caches/pip/http/json-test.bin"), os.urandom(2 * MB))
+    monkeypatch.setattr(cli.llm, "resolve", lambda: None)
+    monkeypatch.setattr(tools, "docker_usage", lambda: None)
+    assert cli.main(["scan", "--json", "--no-files", "--min-size", "1"]) == 0
+    data = json.loads(capsys.readouterr().out)        # nothing but JSON on stdout
+    pip = [i for i in data["items"] if i["path"].endswith("Library/Caches/pip")][0]
+    assert pip["tier"] == "safe" and pip["pre_ticked"] is True

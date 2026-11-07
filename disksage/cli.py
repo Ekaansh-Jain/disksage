@@ -18,13 +18,16 @@ Flags:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
+import json
 import os
 import shutil
 import sys
 import time
 from contextlib import contextmanager
 
-from . import __version__, config, llm, tools
+from . import __version__, config, llm, models, tools
 from .classify import annotate_known, annotate_with_ai, build_file_items, human
 from .safety import (
     empty_trash,
@@ -344,7 +347,7 @@ def cmd_scan(args) -> int:
     _print_report(items, con)
 
     legend = ("Legend  🤖 = labelled by AI (others from the built-in list)   ·   "
-              "SAFE regenerates on its own   ·   REVIEW check first   ·   "
+              "SAFE rebuilds itself   ·   REVIEW check first (goes to the Trash)   ·   "
               "KEEP left alone")
     con.print(f"[dim]{legend}[/dim]") if con else print(legend)
 
@@ -362,11 +365,25 @@ def cmd_scan(args) -> int:
     con.print(msg) if con else print(msg)
 
     _print_tool_tips(con)
+    _print_model_hint(con)
 
     hint = ("\nThis was a read-only report — nothing was deleted.\n"
             "→ Run `disksage clean` to pick items from a checklist and free space.")
     con.print(f"[bold]{hint}[/bold]") if con else print(hint)
     return 0
+
+
+def _print_model_hint(con) -> None:
+    """Point at `disksage models` when two apps hold model files of exactly the
+    same size. Only sizes are compared here (no hashing), so scan stays fast."""
+    sizes: dict[int, set[str]] = {}
+    for f in models.all_model_files():
+        sizes.setdefault(f.size, set()).add(f.store)
+    if any(len(stores) > 1 for stores in sizes.values()):
+        _say(con, "\n[bold]Some models look like they're stored by more than one app.[/bold] "
+                  "Run `disksage models` to check, and `disksage dedupe` to store each once.",
+             "\nSome models look like they're stored by more than one app. "
+             "Run `disksage models` to check.")
 
 
 def _print_tool_tips(con) -> None:
@@ -646,6 +663,138 @@ def _report_freed(free_before: int, trashed: int) -> None:
     print(f"Disk: {_free_space()}")
 
 
+# ---- local models: inventory and clone-based dedupe ----
+
+def _duplicate_plan(min_size: int):
+    """Every model file, plus (keeper, copies-to-clone, reclaimable bytes) per
+    duplicate group. Copies disksage already turned into clones of the same
+    keeper don't count again."""
+    files = models.all_model_files(min_size)
+    records = models.load_clones()
+    plan = []
+    for group in models.find_model_duplicates(files):
+        keep = models.pick_keeper(group)
+        copies = [f for f in group if f is not keep]
+        todo = [f for f in copies if not models.already_shared(records, keep, f)]
+        plan.append((keep, copies, todo, sum(f.on_disk for f in todo)))
+    plan.sort(key=lambda p: -p[3])
+    return files, plan, records
+
+
+def _apps(files) -> str:
+    return ", ".join(sorted({models.STORE_NAMES[f.store] for f in files}))
+
+
+def _model_name(f) -> str:
+    return f.names[0] if f.names else os.path.basename(f.path)
+
+
+def cmd_models(args) -> int:
+    files, plan, _ = _duplicate_plan(args.min_size * 1024 * 1024)
+    if args.json:
+        print(json.dumps({
+            "models": [{"app": f.store, "path": f.path, "bytes": f.size,
+                        "bytes_on_disk": f.on_disk, "sha256": f.sha256, "names": list(f.names)}
+                       for f in files],
+            "duplicates": [{"sha256": keep.sha256, "bytes": keep.size, "keep": keep.path,
+                            "copies": [c.path for c in copies], "reclaimable_bytes": reclaim}
+                           for keep, copies, _, reclaim in plan],
+        }, indent=2))
+        return 0
+
+    con = _console()
+    if not files:
+        print("No local models found (looked in Ollama, LM Studio and the Hugging Face cache).")
+        return 0
+    total = sum(f.on_disk for f in files)
+    _say(con, f"[bold]{len(files)} model file(s), {human(total)} on disk[/bold]",
+         f"{len(files)} model file(s), {human(total)} on disk")
+    for f in files:
+        names = ", ".join(f.names) or "(not referenced by any model)"
+        print(f"  {human(f.on_disk):>9}  {models.STORE_NAMES[f.store]:<12}  {names}")
+        _say(con, f"             [dim]{_short_path(f.path)}[/dim]",
+             f"             {_short_path(f.path)}")
+
+    reclaimable = sum(p[3] for p in plan)
+    if plan:
+        _say(con, "\n[bold]The same file, stored by more than one app:[/bold]",
+             "\nThe same file, stored by more than one app:")
+        for keep, copies, todo, reclaim in plan:
+            group = [keep, *copies]
+            state = f"{human(reclaim)} reclaimable" if todo else "already shared (cloned)"
+            print(f"  {_model_name(keep)} · {human(keep.size)} × {len(group)} copies "
+                  f"({_apps(group)}) · {state}")
+    if reclaimable:
+        _say(con, f"\n[bold]{human(reclaimable)} reclaimable.[/bold] Run `disksage dedupe` to "
+                  f"store each file once: every app keeps its file, nothing is deleted.",
+             f"\n{human(reclaimable)} reclaimable. Run `disksage dedupe` to store each file once.")
+    print("\nTo remove a model for good: "
+          + "; ".join(f"{models.STORE_NAMES[s]}: {h}" for s, h in models.REMOVE_HINTS.items()))
+    return 0
+
+
+def cmd_dedupe(args) -> int:
+    con = _console()
+    _, plan, records = _duplicate_plan(args.min_size * 1024 * 1024)
+    todo = [(keep, f) for keep, _, copies, _ in plan for f in copies]
+    if not todo:
+        print("No duplicate models to reclaim.")
+        return 0
+    total = sum(f.on_disk for _, f in todo)
+    print(f"Replace {len(todo)} duplicate model file(s) with APFS clones — "
+          f"up to {human(total)} reclaimable.")
+    print("Every app keeps a working file at the same path; the bytes are stored once.\n")
+    for keep, f in todo:
+        print(f"  {human(f.on_disk):>9}  {models.STORE_NAMES[f.store]:<12} {_short_path(f.path)}")
+        _say(con, f"             [dim]becomes a clone of {_short_path(keep.path)}[/dim]",
+             f"             becomes a clone of {_short_path(keep.path)}")
+
+    if getattr(args, "dry_run", False):
+        print("\nDry run: nothing was changed.")
+        return 0
+    if sys.platform != "darwin":
+        print("\nReclaiming duplicates needs macOS (APFS clones). Nothing was changed.")
+        return 1
+    if _ask(f"\nType 'yes' to clone these {len(todo)} file(s): ") != "yes":
+        print("Aborted. Nothing was changed.")
+        return 0
+
+    free_before = _free_bytes()
+    for keep, f in todo:
+        ok, reason = is_safe_to_trash(f.path)   # same safety floor as `clean`
+        if not ok:
+            print(f"  skipped (protected): {f.path} — {reason}")
+            continue
+        try:
+            if models.replace_with_clone(keep.path, f.path):
+                models.record_clone(records, keep.path, f.path)
+                print(f"  cloned: {_short_path(f.path)}")
+            else:
+                print(f"  skipped (not identical, or on another volume): {_short_path(f.path)}")
+        except Exception as e:
+            print(f"  FAILED: {f.path} — {e}")
+    models.save_clones(records)
+    gained = max(0, _free_bytes() - free_before)
+    print(f"\nDone. Free space went up by {human(gained)} (measured).")
+    print(f"Disk: {_free_space()}")
+    return 0
+
+
+def _scan_json(args) -> int:
+    """`scan --json`: the same scan, as data for scripts and agents."""
+    with contextlib.redirect_stdout(io.StringIO()):   # keep progress text out of the JSON
+        items = _scan_and_classify(args, None)
+    print(json.dumps({
+        "version": __version__,
+        "free_bytes": _free_bytes(),
+        "items": [{"path": i.path, "tier": i.tier, "label": i.label, "why": i.why,
+                   "source": i.source, "kind": i.kind, "bytes_on_disk": i.size,
+                   "pre_ticked": _default_checked(i), "git_tracked_files": i.tracked}
+                  for i in sorted(items, key=lambda i: -i.size)],
+    }, indent=2))
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         prog="disksage",
@@ -657,14 +806,24 @@ def main(argv=None) -> int:
             "  disksage scan         same as above\n"
             "  disksage clean        pick items from a checklist and free space\n"
             "  disksage clean --dry-run   show what clean would do, change nothing\n"
+            "  disksage models       every local model, and the ones stored twice\n"
+            "  disksage dedupe       reclaim duplicate models as APFS clones\n"
             "  disksage setup        choose an AI provider / paste a key\n"
             "  disksage clean --min-size 5 --no-ai\n"
         ))
     p.add_argument("--version", action="version", version=f"disksage {__version__}")
-    sub = p.add_subparsers(dest="cmd", metavar="{scan,clean,setup}")
+    sub = p.add_subparsers(dest="cmd", metavar="{scan,clean,models,dedupe,setup,doctor}")
 
     sub.add_parser("setup", help="choose an AI provider and save your key")
     sub.add_parser("doctor", help="show the active provider and detected local servers")
+
+    mp = sub.add_parser("models", help="list local models (Ollama, LM Studio, Hugging Face) "
+                                       "and find the ones stored more than once")
+    mp.add_argument("--min-size", type=int, default=50, help="MB threshold (default 50)")
+    mp.add_argument("--json", action="store_true", help="print the result as JSON")
+    dp = sub.add_parser("dedupe", help="replace duplicate model files with APFS clones")
+    dp.add_argument("--min-size", type=int, default=50, help="MB threshold (default 50)")
+    dp.add_argument("--dry-run", action="store_true", help="show the plan, change nothing")
 
     for name in ("scan", "clean"):
         sp = sub.add_parser(name)
@@ -684,6 +843,9 @@ def main(argv=None) -> int:
         if name == "clean":
             sp.add_argument("--dry-run", action="store_true",
                             help="show what would be deleted or trashed, change nothing")
+        else:
+            sp.add_argument("--json", action="store_true",
+                            help="print the result as JSON (for scripts and agents)")
 
     args = p.parse_args(argv)
     config.load()
@@ -692,6 +854,10 @@ def main(argv=None) -> int:
         return cmd_setup(args)
     if args.cmd == "doctor":
         return cmd_doctor(args)
+    if args.cmd == "models":
+        return cmd_models(args)
+    if args.cmd == "dedupe":
+        return cmd_dedupe(args)
 
     if getattr(args, "provider", None):
         os.environ["DISKSAGE_PROVIDER"] = args.provider
@@ -704,6 +870,8 @@ def main(argv=None) -> int:
     # own, and the scan says when an AI could identify more.
     if args.cmd == "clean":
         return cmd_clean(args)
+    if getattr(args, "json", False):
+        return _scan_json(args)
     return cmd_scan(args)
 
 

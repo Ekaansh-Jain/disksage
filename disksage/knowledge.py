@@ -59,6 +59,9 @@ RULES: list[Rule] = [
          path_glob=_h("Library/Mail*")),
     Rule("keep", "Messages history", "your iMessage history",
          path_glob=_h("Library/Messages*")),
+    Rule("keep", "iPhone/iPad backups",
+         "real data; remove old ones in Finder > your device > Manage Backups",
+         path_glob="*/Application Support/MobileSync*"),
 
     # ---- SAFE: caches that always regenerate ----
     Rule("safe", "pip download cache", "Python re-downloads on next install",
@@ -99,7 +102,7 @@ RULES: list[Rule] = [
          name_glob=".mypy_cache"),
     Rule("safe", "ruff cache", "regenerated on next lint",
          name_glob=".ruff_cache"),
-    Rule("safe", "Turd cache", "regenerated build cache",
+    Rule("safe", "Turbo cache", "regenerated build cache",
          name_glob=".turbo"),
     Rule("safe", "Arduino installers", "downloaded installers, re-fetched",
          path_glob=_h("Library/Arduino15/staging")),
@@ -159,9 +162,19 @@ RULES: list[Rule] = [
          path_glob="*/Application Support/Steam/steamapps*"),
 
     # ---- REVIEW: local model stores (large, but re-downloadable) ----
-    Rule("safe", "HuggingFace cache", "re-downloads models/datasets on demand",
+    # Re-downloadable isn't the same as "regenerates on its own": deleting these
+    # costs gigabytes of downloads, so they're never pre-ticked. scan.py lists
+    # the Hugging Face folder's children separately (and safety.py protects the
+    # login token stored next to them).
+    Rule("safe", "Hugging Face download cache", "chunk cache for downloads; rebuilt as needed",
+         path_glob="*/.cache/huggingface/xet"),
+    Rule("review", "Hugging Face models", "re-downloaded on next use; `hf cache rm` removes one",
+         path_glob="*/.cache/huggingface/hub"),
+    Rule("review", "Hugging Face datasets", "re-downloaded or re-processed on next use",
+         path_glob="*/.cache/huggingface/datasets"),
+    Rule("review", "Hugging Face data", "models and datasets; re-downloadable",
          path_glob="*/.cache/huggingface*"),
-    Rule("safe", "PyTorch hub cache", "re-downloads models on demand",
+    Rule("review", "PyTorch hub cache", "re-downloads models on demand",
          path_glob="*/.cache/torch*"),
     Rule("review", "LM Studio models", "re-downloadable from LM Studio",
          path_glob="*/.lmstudio/models*"),

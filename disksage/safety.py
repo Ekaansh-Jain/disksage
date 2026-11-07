@@ -5,8 +5,10 @@ here lets it delete something dangerous. The rules are dumb, deterministic, and
 unbreakable on purpose:
 
   1. Only ever act inside the user's home directory.
-  2. Never touch a protected path (keychains, sandbox data, top-level folders).
-  3. Warn before removing a git repo that has unpushed or uncommitted work.
+  2. Never touch a protected path (keychains, sandbox data, top-level folders,
+     cloud-synced folders, credentials) or anything inside a macOS package.
+  3. Warn before removing a git repo that has unpushed or uncommitted work,
+     or a folder whose files git tracks (that's source, not build output).
   4. Delete = move to Trash (send2trash), never `rm -rf`. Mistakes are undoable.
 """
 
@@ -15,6 +17,8 @@ from __future__ import annotations
 import os
 import subprocess
 from fnmatch import fnmatch
+
+from .scan import is_package
 
 HOME = os.path.expanduser("~")
 
@@ -26,6 +30,20 @@ PROTECTED_GLOBS = [
     os.path.join(HOME, "Library/Mail*"),
     os.path.join(HOME, "Library/Messages*"),
     os.path.join(HOME, "Library/Preferences*"),
+    # Synced folders: deleting here deletes the file in the cloud and on your
+    # other devices, and often frees nothing (the file may be a placeholder).
+    os.path.join(HOME, "Library/Mobile Documents*"),         # iCloud Drive
+    os.path.join(HOME, "Library/CloudStorage*"),             # Dropbox, OneDrive, Google Drive
+    # iPhone/iPad backups: real data. Manage them in Finder instead.
+    os.path.join(HOME, "Library/Application Support/MobileSync*"),
+    # Credentials and tool config.
+    os.path.join(HOME, ".ssh*"),
+    os.path.join(HOME, ".gnupg*"),
+    os.path.join(HOME, ".aws*"),
+    os.path.join(HOME, ".kube*"),
+    os.path.join(HOME, ".config*"),
+    os.path.join(HOME, ".cache/huggingface/token"),
+    os.path.join(HOME, ".cache/huggingface/stored_tokens"),
     "*.photoslibrary",
 ]
 
@@ -45,6 +63,13 @@ def _within_home(path: str) -> bool:
     return real == HOME or real.startswith(HOME + os.sep)
 
 
+def inside_package(path: str) -> bool:
+    """True if any folder above `path` is a macOS package. A file inside a
+    Photos library, an app or a Final Cut library is that app's data."""
+    parents = os.path.realpath(path).split(os.sep)[:-1]
+    return any(part and is_package(part) for part in parents)
+
+
 def is_safe_to_trash(path: str) -> tuple[bool, str]:
     """Deterministic veto. Returns (allowed, reason_if_blocked)."""
     real = os.path.realpath(path)
@@ -57,6 +82,8 @@ def is_safe_to_trash(path: str) -> tuple[bool, str]:
         return False, "this is your home directory"
     if real in PROTECTED_ROOTS:
         return False, "protected top-level folder"
+    if is_package(real) or inside_package(real):
+        return False, "inside a macOS package (library, app or bundle)"
     for glob in PROTECTED_GLOBS:
         if fnmatch(real, glob) or fnmatch(path, glob):
             return False, "protected system/app data"
@@ -90,6 +117,25 @@ def git_risk(path: str) -> str | None:
     if dirty:
         parts.append(f"{len(dirty.splitlines())} uncommitted change(s)")
     return "; ".join(parts) if parts else None
+
+
+def tracked_file_count(path: str, timeout: float = 8.0) -> int:
+    """How many files under `path` the surrounding git repo tracks.
+
+    git_risk() only notices a .git *inside* a folder. A committed build/ or
+    dist/ folder has none, yet its files are source, not output — so ask the
+    repo around it. Returns 0 outside a repo or when git isn't installed."""
+    real = os.path.realpath(path).rstrip(os.sep)
+    parent, name = os.path.split(real)
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}
+    try:
+        result = subprocess.run(["git", "-C", parent, "ls-files", "-z", "--", name],
+                                capture_output=True, timeout=timeout, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    if result.returncode != 0:  # not inside a repo
+        return 0
+    return result.stdout.count(b"\0")
 
 
 def trash(path: str) -> None:

@@ -22,8 +22,8 @@ from contextlib import contextmanager
 
 from . import __version__, config, llm
 from .classify import annotate_known, annotate_with_ai, build_file_items, human
-from .safety import git_risk, is_safe_to_trash, trash
-from .scan import collect_files, scan_dirs
+from .safety import git_risk, is_safe_to_trash, tracked_file_count, trash
+from .scan import CRUFT_DIR_NAMES, collect_files, scan_dirs
 
 HOME = os.path.expanduser("~")
 
@@ -253,6 +253,20 @@ def _status(con, text: str):
         yield
 
 
+def _flag_project_folders(items) -> None:
+    """A project folder named like build output (build/, dist/, target/…) can
+    still hold source code that git tracks. Flag those so they're never
+    pre-ticked and the user sees why."""
+    for it in items:
+        if it.kind != "dir" or os.path.basename(it.path) not in CRUFT_DIR_NAMES:
+            continue
+        it.tracked = tracked_file_count(it.path)
+        if it.tracked:
+            it.tier = "review"
+            it.why = (f"⚠ {it.tracked} file(s) here are tracked by git: "
+                      f"this is source, not build output")
+
+
 def _scan_and_classify(args, con):
     mb = 1024 * 1024
     _print_provider_banner(con)
@@ -261,6 +275,7 @@ def _scan_and_classify(args, con):
         dir_items = scan_dirs(min_size=args.min_size * mb, root=args.root)
 
     unknown = annotate_known(dir_items)
+    _flag_project_folders(dir_items)
     provider = llm.resolve()
     if not args.no_ai and unknown and provider:
         with _status(con, f"Identifying {len(unknown)} unrecognized item(s) with {provider['name']}…"):
@@ -349,7 +364,9 @@ def _default_checked(it) -> bool:
     # Pre-tick only the low-risk items: knowledge-base safe caches. Duplicates
     # start unchecked: two identical files in different projects may each be
     # used by code, so the user decides. Review and AI-tagged items start
-    # unchecked so the user opts in.
+    # unchecked so the user opts in, and so does anything git tracks.
+    if getattr(it, "tracked", 0):
+        return False
     return it.tier == "safe" and it.source != "ai"
 
 
@@ -486,6 +503,9 @@ def cmd_clean(args) -> int:
         _, tag = TIER_STYLE[it.tier]
         line = f"  {tag} {human(it.size):>9}  {it.path}"
         risk = git_risk(it.path) if it.kind != "duplicate" else None
+        if getattr(it, "tracked", 0):
+            tracked = f"{it.tracked} file(s) tracked by git: source, not build output"
+            risk = f"{risk}; {tracked}" if risk else tracked
         if risk:
             line += f"\n      ⚠️  {risk}"
             risky += 1

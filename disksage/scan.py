@@ -58,8 +58,31 @@ SINGLETONS = [
     os.path.join(HOME, ".keras"),
 ]
 
+# Folders that hold several separately-reclaimable things. Instead of offering
+# the whole folder, each child is its own candidate — e.g. Hugging Face keeps
+# models, datasets, a download cache and your login token side by side.
+NESTED_CONTAINERS = [
+    os.path.join(HOME, ".cache/huggingface"),
+]
+
 # Directories never descended into when hunting for big loose files.
 FILE_WALK_SKIP = CRUFT_DIR_NAMES | {".git"}
+
+# macOS packages: folders Finder shows as a single file. Their insides are an
+# app's data (a Photos library, an app bundle, a Final Cut library, a VM), so we
+# never descend into them and the safety floor never lets anything inside go.
+PACKAGE_SUFFIXES = (
+    ".app", ".bundle", ".framework", ".plugin", ".kext",
+    ".photoslibrary", ".photolibrary", ".aplibrary", ".migratedphotolibrary",
+    ".fcpbundle", ".imovielibrary", ".logicx", ".band", ".musiclibrary", ".tvlibrary",
+    ".lrlibrary", ".xcarchive", ".xcodeproj", ".xcworkspace", ".playground",
+    ".pages", ".numbers", ".key", ".rtfd", ".scriv",
+    ".sparsebundle", ".pvm", ".vmwarevm", ".utm",
+)
+
+
+def is_package(name_or_path: str) -> bool:
+    return name_or_path.rstrip(os.sep).lower().endswith(PACKAGE_SUFFIXES)
 
 MAX_WALK_DEPTH = 6  # don't spelunk forever inside project roots
 
@@ -88,6 +111,9 @@ class Item:
     label: str = ""
     why: str = ""
     source: str = ""
+    # filled in by the CLI for project folders
+    tracked: int = 0           # files under this path that git tracks (source, not output)
+    touched: float = 0.0       # when the project around it was last worked on (Unix time)
 
 
 def size_on_disk(st: os.stat_result) -> int:
@@ -170,7 +196,9 @@ def _walk_for_cruft(root: str, found: list[str]) -> None:
         pruned = []
         for name in list(dirnames):
             full = os.path.join(dirpath, name)
-            if name in CRUFT_DIR_NAMES:
+            if is_package(name):
+                pruned.append(name)  # an app's data, never ours to judge
+            elif name in CRUFT_DIR_NAMES:
                 found.append(full)
                 pruned.append(name)  # don't descend into a matched dir
         for name in pruned:
@@ -184,7 +212,9 @@ def _drill_for_buried(root: str, found: list[str]) -> None:
             dirnames[:] = []
             continue
         for name in list(dirnames):
-            if name in BURIED_CACHE_NAMES:
+            if is_package(name):
+                dirnames.remove(name)
+            elif name in BURIED_CACHE_NAMES:
                 found.append(os.path.join(dirpath, name))
                 dirnames.remove(name)  # don't descend further into it
 
@@ -206,6 +236,15 @@ def collect_candidates(root: str | None = None) -> list[str]:
             try:
                 for name in os.listdir(container):
                     paths.add(os.path.join(container, name))
+            except OSError:
+                pass
+
+    for nested in NESTED_CONTAINERS:
+        if nested in paths and os.path.isdir(nested):
+            paths.discard(nested)
+            try:
+                for name in os.listdir(nested):
+                    paths.add(os.path.join(nested, name))
             except OSError:
                 pass
 
@@ -279,7 +318,8 @@ def collect_files(file_min: int, roots: list[str] | None = None,
             if dirpath.count(os.sep) - base_depth >= MAX_WALK_DEPTH:
                 dirnames[:] = []
                 continue
-            dirnames[:] = [d for d in dirnames if d not in FILE_WALK_SKIP]
+            dirnames[:] = [d for d in dirnames
+                           if d not in FILE_WALK_SKIP and not is_package(d)]
             for name in filenames:
                 fp = os.path.join(dirpath, name)
                 try:

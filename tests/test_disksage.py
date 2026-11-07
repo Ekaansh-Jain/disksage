@@ -189,3 +189,94 @@ def test_scan_dirs_reports_bytes_on_disk(tmp_path):
     items = scan_dirs(min_size=MB, root=str(tmp_path))
     assert [os.path.basename(i.path) for i in items] == ["node_modules"]
     assert 3 * MB <= items[0].size < 10 * MB
+
+
+# ---- safety floor: packages, synced folders, credentials ----
+
+def _make(path, data=b"x"):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _write(path, data)
+    return path
+
+
+def test_nothing_inside_a_photos_library_can_go():
+    lib = os.path.join(HOME, "Documents", "Photos Library.photoslibrary")
+    photo = _make(os.path.join(lib, "originals", "A", "IMG_0001.mov"))
+    assert safety.is_safe_to_trash(lib)[0] is False
+    assert safety.is_safe_to_trash(photo)[0] is False
+    assert safety.is_safe_to_trash(os.path.dirname(photo))[0] is False
+
+
+def test_package_contents_are_never_scanned():
+    _make(os.path.join(HOME, "Documents", "Trip.photoslibrary", "originals", "big.mov"),
+          os.urandom(2 * MB))
+    _make(os.path.join(HOME, "Documents", "Tool.app", "Contents", "node_modules", "x.js"),
+          os.urandom(2 * MB))
+    files = collect_files(MB, roots=[os.path.join(HOME, "Documents")])
+    assert not [f for f in files if ".photoslibrary" in f.path or ".app" in f.path]
+    folders = scan_dirs(min_size=MB, root=os.path.join(HOME, "Documents"))
+    assert not [i for i in folders if ".app" in i.path]
+
+
+def test_synced_folders_backups_and_credentials_are_protected():
+    for rel in ("Library/Mobile Documents/com~apple~CloudDocs/report.pdf",
+                "Library/CloudStorage/Dropbox/notes.txt",
+                "Library/Application Support/MobileSync/Backup/00008030/Manifest.db",
+                ".ssh/id_ed25519",
+                ".aws/credentials",
+                ".config/gh/hosts.yml",
+                ".cache/huggingface/token"):
+        path = _make(os.path.join(HOME, rel))
+        assert safety.is_safe_to_trash(path)[0] is False, rel
+
+
+def test_model_caches_are_review_not_pre_ticked():
+    for rel in (".cache/huggingface/hub", ".cache/huggingface/datasets", ".cache/torch"):
+        hit = knowledge.look_up(os.path.join(HOME, rel))
+        assert hit.tier == "review", rel
+    assert knowledge.look_up(os.path.join(HOME, ".cache/huggingface/xet")).tier == "safe"
+    assert knowledge.look_up(
+        os.path.join(HOME, "Library/Application Support/MobileSync")).tier == "keep"
+
+
+def test_huggingface_folder_is_offered_piece_by_piece():
+    from disksage.scan import collect_candidates
+    for rel in ("hub/models--x--y/blobs/a", "datasets/glue/data.arrow", "token"):
+        _make(os.path.join(HOME, ".cache/huggingface", rel))
+    candidates = collect_candidates()
+    assert os.path.join(HOME, ".cache/huggingface") not in candidates
+    assert os.path.join(HOME, ".cache/huggingface/hub") in candidates
+    assert os.path.join(HOME, ".cache/huggingface/datasets") in candidates
+
+
+def test_turbo_label():
+    assert knowledge.look_up("/x/proj/.turbo").label == "Turbo cache"
+
+
+# ---- git-tracked folders are source, not build output ----
+
+def _git(*args, cwd):
+    import subprocess
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+
+def test_git_tracked_build_folder_is_flagged_and_never_pre_ticked():
+    repo = os.path.join(HOME, "Developer", "app")
+    _make(os.path.join(repo, "build", "release.sh"), b"echo release\n")
+    _make(os.path.join(repo, "dist", "bundle.js"), b"// generated\n")
+    _git("init", "-q", cwd=repo)
+    _git("add", "build", cwd=repo)
+    _git("-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "init", cwd=repo)
+
+    assert safety.tracked_file_count(os.path.join(repo, "build")) == 1
+    assert safety.tracked_file_count(os.path.join(repo, "dist")) == 0   # untracked output
+    assert safety.tracked_file_count(os.path.join(HOME, "Documents")) == 0  # not a repo
+
+    from disksage.scan import Item
+    items = [Item(path=os.path.join(repo, "build"), size=1, tier="review", source="knowledge"),
+             Item(path=os.path.join(repo, "dist"), size=1, tier="review", source="knowledge")]
+    cli._flag_project_folders(items)
+    assert items[0].tracked == 1 and "tracked by git" in items[0].why
+    assert items[1].tracked == 0
+    items[0].tier = "safe"
+    assert cli._default_checked(items[0]) is False

@@ -20,9 +20,16 @@ import shutil
 import sys
 from contextlib import contextmanager
 
-from . import __version__, config, llm
+from . import __version__, config, llm, tools
 from .classify import annotate_known, annotate_with_ai, build_file_items, human
-from .safety import git_risk, is_safe_to_trash, tracked_file_count, trash
+from .safety import (
+    empty_trash,
+    git_risk,
+    is_safe_to_trash,
+    remove_regenerable,
+    tracked_file_count,
+    trash,
+)
 from .scan import CRUFT_DIR_NAMES, collect_files, scan_dirs
 
 HOME = os.path.expanduser("~")
@@ -336,10 +343,30 @@ def cmd_scan(args) -> int:
            f"Disk: {_free_space()}")
     con.print(msg) if con else print(msg)
 
+    _print_tool_tips(con)
+
     hint = ("\nThis was a read-only report — nothing was deleted.\n"
             "→ Run `disksage clean` to pick items from a checklist and free space.")
     con.print(f"[bold]{hint}[/bold]") if con else print(hint)
     return 0
+
+
+def _print_tool_tips(con) -> None:
+    """Space a file scan can't judge: Docker's disk image, and tools that can
+    clean up after themselves while keeping what's still in use."""
+    usage = tools.docker_usage()
+    if usage:
+        _say(con, "\n[bold]Docker[/bold] (inside its own disk image; `disksage clean` "
+                  "can run Docker's cleanup for you):",
+             "\nDocker (inside its own disk image; `disksage clean` can run Docker's cleanup):")
+        print("\n".join(f"  {line}" for line in usage.splitlines()))
+    tips = [c for c in tools.available() if c.tool != "docker"]
+    if tips:
+        _say(con, "\n[bold]Your tools' own cleanup commands[/bold] "
+                  "(they keep what you still use; disksage doesn't run these):",
+             "\nYour tools' own cleanup commands (disksage doesn't run these):")
+        for c in tips:
+            print(f"  {c.display:<34} {c.removes}")
 
 
 def _ask(prompt: str) -> str:
@@ -375,7 +402,7 @@ def _short_path(path: str) -> str:
 
 
 _TIER_HEADINGS = {
-    "safe": "SAFE — regenerates automatically",
+    "safe": "SAFE — rebuilds itself; deleted directly",
     "duplicate": "DUPLICATES — one original is always kept; tick the copies you don't need",
     "review": "REVIEW — reclaimable, but check first",
 }
@@ -448,13 +475,14 @@ def _select_tui(actionable):
 def _select_prompts(actionable):
     """Fallback selection: bulk prompts + per-item y/N (used when no TTY)."""
     queue = []
-    safe_bulk = [i for i in actionable if i.tier == "safe" and i.source != "ai"]
+    safe_bulk = [i for i in actionable if _default_checked(i)]
     dups = [i for i in actionable if i.tier == "duplicate"]
     rest = [i for i in actionable if i not in safe_bulk and i not in dups]
 
     if safe_bulk:
         total = sum(i.size for i in safe_bulk)
-        if _ask(f"\nMove all {len(safe_bulk)} known-safe items ({human(total)}) to Trash? [y/N] ") == "y":
+        if _ask(f"\nDelete all {len(safe_bulk)} known caches that rebuild themselves "
+                f"({human(total)})? [y/N] ") == "y":
             queue.extend(safe_bulk)
     if dups:
         total = sum(i.size for i in dups)
@@ -471,8 +499,8 @@ def _select_prompts(actionable):
 def cmd_clean(args) -> int:
     con = _console()
     intro = ("disksage clean — you'll get a checklist to tick what to remove.\n"
-             "Nothing is deleted until you review the final list and type 'yes', "
-             "and everything goes to the Trash (recoverable).")
+             "Nothing changes until you review the final list and type 'yes'. Caches that "
+             "rebuild themselves are deleted; everything else goes to the Trash (recoverable).")
     con.print(f"[bold]{intro}[/bold]\n") if con else print(intro + "\n")
 
     items = _scan_and_classify(args, con)
@@ -495,46 +523,105 @@ def cmd_clean(args) -> int:
         return 0
 
     # ---- Step 2: final review + one explicit confirmation before anything moves ----
+    deletes = [i for i in queue if _deletes_directly(i)]
+    trashes = [i for i in queue if not _deletes_directly(i)]
     total = sum(i.size for i in queue)
     print(f"\n{'─' * 60}")
-    print(f"About to move {len(queue)} item(s) — {human(total)} — to the Trash:\n")
+    print(f"About to clean {len(queue)} item(s) — {human(total)}:")
     risky = 0
-    for it in queue:
-        _, tag = TIER_STYLE[it.tier]
-        line = f"  {tag} {human(it.size):>9}  {it.path}"
-        risk = git_risk(it.path) if it.kind != "duplicate" else None
-        if getattr(it, "tracked", 0):
-            tracked = f"{it.tracked} file(s) tracked by git: source, not build output"
-            risk = f"{risk}; {tracked}" if risk else tracked
-        if risk:
-            line += f"\n      ⚠️  {risk}"
-            risky += 1
-        print(line)
+    for heading, group in (
+            ("Delete (caches that rebuild themselves):", deletes),
+            ("Move to the Trash (you can get these back):", trashes)):
+        if not group:
+            continue
+        print(f"\n  {heading}")
+        for it in group:
+            _, tag = TIER_STYLE[it.tier]
+            line = f"    {tag} {human(it.size):>9}  {it.path}"
+            risk = git_risk(it.path) if it.kind != "duplicate" else None
+            if getattr(it, "tracked", 0):
+                tracked = f"{it.tracked} file(s) tracked by git: source, not build output"
+                risk = f"{risk}; {tracked}" if risk else tracked
+            if risk:
+                line += f"\n        ⚠️  {risk}"
+                risky += 1
+            print(line)
     if risky:
         print(f"\n  ⚠️  {risky} item(s) above carry a git warning — review them.")
-    print("\nEverything goes to the Trash and can be recovered from there.")
 
-    confirm = _ask(f"\nType 'yes' to move these {len(queue)} item(s) to the Trash: ")
+    if getattr(args, "dry_run", False):
+        print("\nDry run: nothing was deleted or moved.")
+        return 0
+
+    confirm = _ask(f"\nType 'yes' to clean these {len(queue)} item(s): ")
     if confirm != "yes":
         print("Aborted. Nothing was deleted.")
         return 0
 
-    freed = 0
+    free_before = _free_bytes()
+    trashed = 0
     for it in queue:
         ok, reason = is_safe_to_trash(it.path)   # safety floor, re-checked at execution
         if not ok:
             print(f"  skipped (protected): {it.path} — {reason}")
             continue
         try:
-            trash(it.path)
-            freed += it.size
-            print(f"  trashed: {it.path}")
+            if _deletes_directly(it):
+                remove_regenerable(it.path)
+                print(f"  deleted: {it.path}")
+            else:
+                trash(it.path)
+                trashed += it.size
+                print(f"  trashed: {it.path}")
         except Exception as e:
             print(f"  FAILED: {it.path} — {e}")
 
-    print(f"\nDone. Moved ~{human(freed)} to the Trash (recoverable from there).")
-    print(f"Disk: {_free_space()}")
+    _offer_docker_prune()
+    _report_freed(free_before, trashed)
     return 0
+
+
+def _free_bytes() -> int:
+    return shutil.disk_usage(HOME).free
+
+
+def _deletes_directly(it) -> bool:
+    """Caches that rebuild themselves (SAFE in the built-in list) are deleted
+    outright: in the Trash they'd free nothing until it's emptied. Anything
+    that could be yours (REVIEW, duplicates, AI-labelled items) goes to the
+    Trash instead."""
+    return it.tier == "safe" and it.source == "knowledge" and not getattr(it, "tracked", 0)
+
+
+def _offer_docker_prune() -> None:
+    """Docker's disk image is invisible to a file scan, so show Docker's own
+    report and offer Docker's own cleanup command."""
+    usage = tools.docker_usage()
+    if not usage:
+        return
+    print("\nDocker keeps images and containers inside its own disk image. Docker's report:")
+    print("\n".join(f"  {line}" for line in usage.splitlines()))
+    prune = tools.DOCKER_PRUNE
+    if _ask(f"Run `{prune.display}` to remove {prune.removes}? [y/N] ") == "y":
+        ok, last = tools.run(prune)
+        print(f"  {'done' if ok else 'failed'}{': ' + last if last else ''}")
+
+
+def _report_freed(free_before: int, trashed: int) -> None:
+    """The only number worth trusting: how much free space actually changed."""
+    gained = max(0, _free_bytes() - free_before)
+    print(f"\nDone. Free space went up by {human(gained)} (measured).")
+    if trashed:
+        print(f"{human(trashed)} is in the Trash and frees its space once the Trash is emptied.")
+        if sys.platform == "darwin" and _ask(
+                "Empty the Trash now? This also removes anything else already in it. [y/N] ") == "y":
+            ok, err = empty_trash()
+            if ok:
+                gained = max(0, _free_bytes() - free_before)
+                print(f"Trash emptied. Free space is up by {human(gained)} in total.")
+            else:
+                print(f"Couldn't empty the Trash ({err}). You can empty it from the Dock.")
+    print(f"Disk: {_free_space()}")
 
 
 def main(argv=None) -> int:
@@ -546,7 +633,8 @@ def main(argv=None) -> int:
             "examples:\n"
             "  disksage              scan and report (deletes nothing)\n"
             "  disksage scan         same as above\n"
-            "  disksage clean        pick items from a checklist to move to Trash\n"
+            "  disksage clean        pick items from a checklist and free space\n"
+            "  disksage clean --dry-run   show what clean would do, change nothing\n"
             "  disksage setup        choose an AI provider / paste a key\n"
             "  disksage clean --min-size 5 --no-ai\n"
         ))
@@ -569,6 +657,9 @@ def main(argv=None) -> int:
         sp.add_argument("--provider", default=None, help="local|groq|gemini")
         sp.add_argument("--no-ai", action="store_true")
         sp.add_argument("--root", default=None)
+        if name == "clean":
+            sp.add_argument("--dry-run", action="store_true",
+                            help="show what would be deleted or trashed, change nothing")
 
     args = p.parse_args(argv)
     config.load()

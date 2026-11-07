@@ -49,7 +49,8 @@ SINGLETONS = [
     os.path.join(HOME, "Library/Arduino15/packages"),
     os.path.join(HOME, "Library/Developer/Xcode/DerivedData"),
     os.path.join(HOME, "Library/Developer/Xcode/iOS DeviceSupport"),
-    os.path.join(HOME, ".Trash"),
+    # (~/.Trash is deliberately not here: it can't be moved into itself, and
+    #  `disksage clean` offers to empty it at the end instead.)
     os.path.join(HOME, ".m2/repository"),
     os.path.join(HOME, ".gradle/caches"),
     # local model stores — big, outside the usual cache/support dirs

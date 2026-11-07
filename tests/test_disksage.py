@@ -280,3 +280,97 @@ def test_git_tracked_build_folder_is_flagged_and_never_pre_ticked():
     assert items[1].tracked == 0
     items[0].tier = "safe"
     assert cli._default_checked(items[0]) is False
+
+
+# ---- clean frees space for real ----
+
+def test_remove_regenerable_deletes_a_cache_but_never_a_symlink_target(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    _write(cache / "a.bin", b"x" * 100)
+    safety.remove_regenerable(str(cache))
+    assert not cache.exists()
+
+    data = tmp_path / "real-data"
+    data.mkdir()
+    _write(data / "keep.txt", b"important")
+    link = tmp_path / "link-to-data"
+    os.symlink(data, link)
+    safety.remove_regenerable(str(link))
+    assert not os.path.lexists(link)
+    assert (data / "keep.txt").exists()
+
+
+def test_trash_folder_is_never_offered():
+    from disksage.scan import SINGLETONS
+    assert os.path.join(HOME, ".Trash") not in SINGLETONS
+    assert knowledge.look_up(os.path.join(HOME, ".Trash")) is None
+
+
+def test_only_built_in_safe_caches_are_deleted_directly():
+    from disksage.scan import Item
+    cache = Item(path="/x/pip", size=1, tier="safe", source="knowledge")
+    ai_cache = Item(path="/x/thing", size=1, tier="safe", source="ai")
+    venv = Item(path="/x/.venv", size=1, tier="review", source="knowledge")
+    dup = Item(path="/x/copy.bin", size=1, tier="duplicate", source="hash")
+    assert cli._deletes_directly(cache)
+    assert not any(cli._deletes_directly(i) for i in (ai_cache, venv, dup))
+
+
+def test_docker_and_tool_tips_need_the_tool(monkeypatch):
+    from disksage import tools
+    monkeypatch.setattr(tools.shutil, "which", lambda _: None)
+    assert tools.docker_usage() is None
+    assert tools.available() == []
+    for cleanup in tools.NATIVE_CLEANUPS:
+        assert cleanup.command[0] == cleanup.tool and cleanup.removes
+
+
+def _answer(prompt=""):
+    # Non-interactive `clean`: delete known caches, trash node_modules, say no to the rest.
+    if "known caches" in prompt:
+        return "y"
+    if "node_modules" in prompt:
+        return "y"
+    if "Type 'yes'" in prompt:
+        return "yes"
+    return "n"
+
+
+def _clutter():
+    pip_cache = os.path.join(HOME, "Library/Caches/pip")
+    _make(os.path.join(pip_cache, "http", "wheel.bin"), os.urandom(3 * MB))
+    node_modules = os.path.join(HOME, "Projects", "shop", "node_modules")
+    _make(os.path.join(node_modules, "big.bin"), os.urandom(3 * MB))
+    return pip_cache, node_modules
+
+
+def test_clean_deletes_caches_and_trashes_the_rest(monkeypatch, capsys):
+    from disksage import tools
+    pip_cache, node_modules = _clutter()
+    trashed = []
+    monkeypatch.setattr(cli, "trash", trashed.append)
+    monkeypatch.setattr(tools, "docker_usage", lambda: None)
+    monkeypatch.setattr("builtins.input", _answer)
+
+    assert cli.main(["clean", "--no-ai", "--no-files", "--min-size", "1"]) == 0
+
+    out = capsys.readouterr().out
+    assert not os.path.exists(pip_cache)          # deleted directly: it rebuilds itself
+    assert trashed == [node_modules]              # yours to get back: went to the Trash
+    assert "Free space went up by" in out
+
+
+def test_clean_dry_run_changes_nothing(monkeypatch, capsys):
+    from disksage import tools
+    pip_cache, node_modules = _clutter()
+    trashed = []
+    monkeypatch.setattr(cli, "trash", trashed.append)
+    monkeypatch.setattr(tools, "docker_usage", lambda: None)
+    monkeypatch.setattr("builtins.input", _answer)
+
+    assert cli.main(["clean", "--dry-run", "--no-ai", "--no-files", "--min-size", "1"]) == 0
+
+    assert os.path.exists(pip_cache) and os.path.exists(node_modules)
+    assert trashed == []
+    assert "Dry run" in capsys.readouterr().out

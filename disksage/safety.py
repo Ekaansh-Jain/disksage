@@ -9,13 +9,19 @@ unbreakable on purpose:
      cloud-synced folders, credentials) or anything inside a macOS package.
   3. Warn before removing a git repo that has unpushed or uncommitted work,
      or a folder whose files git tracks (that's source, not build output).
-  4. Delete = move to Trash (send2trash), never `rm -rf`. Mistakes are undoable.
+  4. Only caches that rebuild themselves (SAFE in the built-in list, never an
+     AI label) are deleted outright: putting them in the Trash would free
+     nothing until it's emptied. Everything that could be yours moves to the
+     Trash (send2trash), so mistakes stay undoable.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
+import stat
 import subprocess
+import sys
 from fnmatch import fnmatch
 
 from .scan import is_package
@@ -142,3 +148,31 @@ def trash(path: str) -> None:
     """Reversible delete. Raises on failure so the caller can report it."""
     from send2trash import send2trash
     send2trash(path)
+
+
+def remove_regenerable(path: str) -> None:
+    """Permanently delete a cache that rebuilds itself.
+
+    Only for items whose SAFE tier came from the built-in list (never from the
+    AI), and only after is_safe_to_trash() said yes. Raises on failure so the
+    caller can report it."""
+    st = os.lstat(path)
+    if stat.S_ISDIR(st.st_mode):
+        shutil.rmtree(path)
+    else:
+        os.remove(path)  # a file, or a symlink (removes the link, not its target)
+
+
+def empty_trash(timeout: float = 900) -> tuple[bool, str]:
+    """macOS only: empty the Trash through Finder, like Finder > Empty Trash.
+    The first time, macOS asks whether your terminal may control Finder.
+    Returns (succeeded, error message)."""
+    if sys.platform != "darwin":
+        return False, "emptying the Trash is only supported on macOS"
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", 'tell application "Finder" to empty trash'],
+            capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+    return result.returncode == 0, result.stderr.strip()
